@@ -1,0 +1,2 @@
+2048
+font UBUNTU24 msyh.ttc UWEeGSc 24 0

@@ -1,0 +1,44 @@
+# ===== 构建产物 =====
+# 注意：只忽略构建目录与明确的编译中间产物。
+# 不要忽略 Makefile / cmake_install.cmake 等文件名——ext/ 下的第三方子项目可能自带这些文件，
+# 忽略它们会导致别人克隆后无法编译。
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.obj
+*.lo
+*.slo
+*.d
+
+# ===== NRO / 可执行文件产物 =====
+*.nro
+*.nacp
+*.elf
+*.nso
+*.pfs0
+output/
+release/
+
+# ===== 编辑器 / IDE =====
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 日志 =====
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/

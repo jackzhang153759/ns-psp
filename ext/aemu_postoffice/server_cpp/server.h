@@ -1,0 +1,73 @@
+#pragma once
+
+#include <unordered_map>
+#include <list>
+#include <thread>
+#include <semaphore>
+#include <unordered_set>
+
+#include "config.h"
+#include "session.h"
+#include "semaphore.h"
+#include "../adhocctl/server_cpp/snapshot.h"
+#include "snapshot.h"
+#include "native_socket.h"
+#include "enet.h"
+
+namespace aemu_postoffice_server {
+
+enum class ServerPumpStatus{
+	SUCCESS,
+	IDLE,
+	LISTEN_SOCK_DEAD,
+};
+
+class Server{
+	public:
+		Server(const struct config &config);
+		~Server();
+		// pump server processing
+		ServerPumpStatus pump();
+		void update_adhocctl_data(const aemu_postoffice_adhocctl_server::snapshot &snapshot);
+		void set_config(const struct config &config);
+		struct snapshot get_snapshot();
+
+	private:
+		std::list<PendingSession> pending_sessions;
+		std::unordered_map<std::string, Session> sessions;
+		std::unordered_map<std::string, int> per_mac_session_count;
+
+		bool stopping;
+
+		std::vector<Semaphore> pending_sessions_pump_worker_semas;
+		std::vector<Semaphore> pending_sessions_pump_worker_done_semas;
+		std::vector<std::thread> pending_sessions_pump_workers;
+		std::vector<std::list<PendingSession*>> to_pump_pending_sessions;
+		std::vector<std::list<PendingSession*>> pending_sessions_to_remove;
+		std::vector<std::list<PendingSession*>> ready_pending_sessions;
+
+		std::vector<Semaphore> session_from_client_pump_worker_semas;
+		std::vector<Semaphore> session_from_client_pump_worker_done_semas;
+		std::vector<std::thread> session_from_client_pump_workers;
+		std::vector<std::list<Session *>> sessions_to_pump;
+		std::vector<std::unordered_set<std::string>> sessions_to_remove;
+		std::vector<std::unordered_map<std::string, std::list<SendListItem>>> send_list;
+
+		std::vector<Semaphore> session_to_client_pump_worker_semas;
+		std::vector<Semaphore> session_to_client_pump_worker_done_semas;
+		std::vector<std::thread> session_to_client_pump_workers;
+
+		int sock_fd;
+		struct config config;
+		aemu_postoffice_adhocctl_server::snapshot adhocctl_snapshot;
+
+		aemu_postoffice_enet::BasicEnetClient *enet_server;
+
+		AddrFamily addr_family;
+
+		void pump_pending_sessions(int set);
+		void pump_connect_and_from_clients(int set);
+		void pump_to_clients(int set);
+};
+
+}

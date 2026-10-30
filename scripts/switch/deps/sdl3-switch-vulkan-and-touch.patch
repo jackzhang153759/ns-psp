@@ -1,0 +1,96 @@
+diff --git a/src/video/switch/SDL_switchtouch.c b/src/video/switch/SDL_switchtouch.c
+index b4c67165af..08be83a9ad 100644
+--- a/src/video/switch/SDL_switchtouch.c
++++ b/src/video/switch/SDL_switchtouch.c
+@@ -35,7 +35,7 @@ void SWITCH_InitTouch(void)
+ {
+     hidInitializeTouchScreen();
+     SDL_AddTouch(touch_id, SDL_TOUCH_DEVICE_DIRECT, "Switch");
+-    SDL_SetHintWithPriority(SDL_HINT_TOUCH_MOUSE_EVENTS, "0", SDL_HINT_DEFAULT);
++    SDL_SetHintWithPriority(SDL_HINT_TOUCH_MOUSE_EVENTS, "0", SDL_HINT_OVERRIDE);
+     SDL_memset(&touchState, 0, sizeof(HidTouchScreenState));
+     SDL_memset(&touchStateOld, 0, sizeof(HidTouchScreenState));
+ }
+@@ -67,15 +67,17 @@ void SWITCH_PollTouch(Uint64 timestamp)
+ 
+                 for (j = 0; j < touchStateOld.count; j++) {
+                     if (touchStateOld.touches[j].finger_id == touchState.touches[i].finger_id) {
+-                        found = false;
++                        found = true;
+                         break;
+                     }
+                 }
+ 
+                 if (!found) {
++                    /* The type parameter decides down vs up - passing a bool here
++                       silently reports every touch as a release. */
+                     SDL_SendTouch(timestamp, id,
+                                   (SDL_FingerID)touchState.touches[i].finger_id + 1,
+-                                  window, false,
++                                  window, SDL_EVENT_FINGER_DOWN,
+                                   (float)touchState.touches[i].x / rel_w,
+                                   (float)touchState.touches[i].y / rel_h, 1);
+                 }
+@@ -88,7 +90,7 @@ void SWITCH_PollTouch(Uint64 timestamp)
+ 
+             for (j = 0; j < touchState.count; j++) {
+                 if (touchState.touches[j].finger_id == touchStateOld.touches[i].finger_id) {
+-                    found = false;
++                    found = true;
+                     /* Finger moved */
+                     if (touchState.touches[j].x != touchStateOld.touches[i].x || touchState.touches[j].y != touchStateOld.touches[i].y) {
+                         SDL_SendTouchMotion(timestamp, id,
+@@ -106,7 +108,7 @@ void SWITCH_PollTouch(Uint64 timestamp)
+                 SDL_SendTouch(timestamp, id,
+                               (SDL_FingerID)touchStateOld.touches[i].finger_id + 1,
+                               window,
+-                              false,
++                              SDL_EVENT_FINGER_UP,
+                               (float)touchStateOld.touches[i].x / rel_w,
+                               (float)touchStateOld.touches[i].y / rel_h, 1);
+             }
+diff --git a/src/video/switch/SDL_switchvideo.c b/src/video/switch/SDL_switchvideo.c
+index 87428777bb..cbef9c0273 100644
+--- a/src/video/switch/SDL_switchvideo.c
++++ b/src/video/switch/SDL_switchvideo.c
+@@ -237,12 +237,18 @@ static bool SWITCH_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_
+     Result rc;
+     SDL_WindowData *window_data = NULL;
+     NWindow *nWindow = NULL;
++    bool external_context;
+ 
+     if (switch_window != NULL) {
+         return SDL_SetError("Switch only supports one window");
+     }
+ 
+-    if (!_this->egl_data) {
++    /* Vulkan and other external APIs create their own surface from the default
++       NWindow, so no EGL surface is needed - or possible - in that case. */
++    external_context = SDL_GetBooleanProperty(create_props,
++        SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, false);
++
++    if (!external_context && !_this->egl_data) {
+         return SDL_SetError("EGL not initialized");
+     }
+ 
+@@ -255,12 +261,17 @@ static bool SWITCH_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_
+ 
+     rc = nwindowSetDimensions(nWindow, window->w, window->h);
+     if (R_FAILED(rc)) {
++        SDL_free(window_data);
+         return SDL_SetError("Could not set NWindow dimensions: 0x%x", rc);
+     }
+ 
+-    window_data->egl_surface = SDL_EGL_CreateSurface(_this, window, nWindow);
+-    if (window_data->egl_surface == EGL_NO_SURFACE) {
+-        return SDL_SetError("Could not create GLES window surface");
++    window_data->egl_surface = EGL_NO_SURFACE;
++    if (!external_context) {
++        window_data->egl_surface = SDL_EGL_CreateSurface(_this, window, nWindow);
++        if (window_data->egl_surface == EGL_NO_SURFACE) {
++            SDL_free(window_data);
++            return SDL_SetError("Could not create GLES window surface");
++        }
+     }
+ 
+     /* Setup driver data for this window */

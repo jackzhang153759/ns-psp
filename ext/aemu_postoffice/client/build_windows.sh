@@ -1,0 +1,34 @@
+set -xe
+
+CC=x86_64-w64-mingw32-gcc
+CPPC=x86_64-w64-mingw32-g++
+
+BUILD_FLAGS="-fPIC -g -O2 -Wformat"
+
+C_SRC="log_impl_stdc postoffice sock_impl_windows postoffice_mem_stdc ../adhocctl/client/adhocctl ../adhocctl/client/adhocctl_mem list enet"
+CPP_SRC="mutex_impl_cpp delay_impl_cpp"
+C_SRC_TEST="test"
+
+lib_objs=""
+
+for f in $C_SRC
+do
+	$CC $BUILD_FLAGS -c ${f}.c -o ${f}.o
+	lib_objs="$lib_objs ${f}.o"
+done
+
+for f in $CPP_SRC
+do
+	$CPPC $BUILD_FLAGS -c ${f}.cpp -o ${f}.o
+	lib_objs="$lib_objs ${f}.o"
+done
+
+test_objs=""
+for f in $C_SRC_TEST
+do
+	$CC $BUILD_FLAGS -c ${f}.c -o ${f}.o
+	test_objs="$test_objs ${f}.o"
+done
+
+$CPPC $BUILD_FLAGS -static $lib_objs $test_objs -lws2_32 -lwinmm -lpthread -o test.exe
+$CPPC $BUILD_FLAGS -shared -static $lib_objs -lws2_32 -lwinmm -o libaemu_postoffice_client.dll

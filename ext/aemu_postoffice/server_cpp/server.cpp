@@ -1,0 +1,534 @@
+#ifdef __unix__
+// for naming threads
+#include <pthread.h>
+#endif
+
+#include <stdio.h>
+
+#include "server.h"
+#include "log.h"
+#include "common.h"
+
+#include "native_socket.h"
+
+#include <mutex>
+
+namespace aemu_postoffice_server {
+
+Server::Server(const struct config &config){
+	this->config = config;
+	this->sock_fd = native_tcp_listen(config.ip_addr, config.port);
+
+	if (this->sock_fd == -1){
+		LOG("%s: failed creating listen socket, 0x%x\n", __func__, native_get_last_socket_error());
+		return;
+	}
+
+	if (this->sock_fd == -2){
+		this->sock_fd = -1;
+		LOG("%s: failed parsing %s as ipv6 nor ipv4\n", __func__, config.ip_addr.c_str());
+		return;
+	}
+
+	addr_family = get_addr_family(config.ip_addr);
+	if (addr_family == AddrFamily::IPV4){
+		// TODO this is a mess, if only it is possible to move around mixed/ipv4 only modes runtime..
+		LOG("%s: not initializing enet in ipv4 only mode\n", __func__);
+		enet_server = NULL;
+	} else {
+		enet_server = new aemu_postoffice_enet::BasicEnetClient();
+		int listen_status = enet_server->listen(config.ip_addr, config.port, config.max_num_sessions, 1);
+		if (listen_status != 0){
+			LOG("%s: failed initializing enet\n", __func__);
+			delete enet_server;
+			enet_server = NULL;
+			return;
+		}
+	}
+
+	this->stopping = false;
+
+	for(int i = 0;i < config.num_threads;i++){
+		this->pending_sessions_pump_worker_semas.push_back(Semaphore());
+		this->pending_sessions_pump_worker_done_semas.push_back(Semaphore());
+		this->session_from_client_pump_worker_semas.push_back(Semaphore());
+		this->session_from_client_pump_worker_done_semas.push_back(Semaphore());
+		this->session_to_client_pump_worker_semas.push_back(Semaphore());
+		this->session_to_client_pump_worker_done_semas.push_back(Semaphore());
+	}
+
+	for(int i = 0;i < config.num_threads;i++){
+		this->pending_sessions_pump_workers.push_back(std::thread([this, i]() {
+			char buf[16] = {0};
+			snprintf(buf, sizeof(buf), "pending_%d", i);
+			set_thread_name(std::string(buf));
+			while(true){
+				this->pending_sessions_pump_worker_semas[i].acquire();
+				if (this->stopping){
+					this->pending_sessions_pump_worker_done_semas[i].release();
+					break;
+				}
+				pump_pending_sessions(i);
+				this->pending_sessions_pump_worker_done_semas[i].release();
+			}
+		}));
+		this->to_pump_pending_sessions.push_back(std::list<PendingSession*>());
+		this->pending_sessions_to_remove.push_back(std::list<PendingSession*>());
+		this->ready_pending_sessions.push_back(std::list<PendingSession*>());
+	}
+
+	for(int i = 0;i < config.num_threads;i++){
+		this->session_from_client_pump_workers.push_back(std::thread([this, i]() {
+			char buf[16] = {0};
+			snprintf(buf, sizeof(buf), "from_client_%d", i);
+			set_thread_name(std::string(buf));
+			while(true){
+				this->session_from_client_pump_worker_semas[i].acquire();
+				if (this->stopping){
+					this->session_from_client_pump_worker_done_semas[i].release();
+					break;
+				}
+				this->pump_connect_and_from_clients(i);
+				this->session_from_client_pump_worker_done_semas[i].release();
+			}
+		}));
+		this->sessions_to_pump.push_back(std::list<Session *>());
+		this->sessions_to_remove.push_back(std::unordered_set<std::string>());
+		this->send_list.push_back(std::unordered_map<std::string, std::list<SendListItem>>());
+	}
+
+	for(int i = 0;i < config.num_threads;i++){
+		this->session_to_client_pump_workers.push_back(std::thread([this, i]() {
+			char buf[16] = {0};
+			snprintf(buf, sizeof(buf), "to_client_%d", i);
+			set_thread_name(std::string(buf));
+			while(true){
+				this->session_to_client_pump_worker_semas[i].acquire();
+				if (this->stopping){
+					this->session_to_client_pump_worker_done_semas[i].release();
+					break;
+				}
+				this->pump_to_clients(i);
+				this->session_to_client_pump_worker_done_semas[i].release();
+			}
+		}));
+	}
+
+	LOG_TS("%s: created server listening on %s %u\n", __func__, config.ip_addr.c_str(), config.port);
+}
+
+Server::~Server(){
+	if (this->sock_fd >= 0){
+		native_close(this->sock_fd);
+	}else{
+		return;
+	}
+
+	this->stopping = true;
+	for(auto &sema : this->pending_sessions_pump_worker_semas){
+		sema.release();
+	}
+	for(auto &sema : this->session_from_client_pump_worker_semas){
+		sema.release();
+	}	
+	for(auto &sema : this->session_to_client_pump_worker_semas){
+		sema.release();
+	}
+	for(auto &thread : this->pending_sessions_pump_workers){
+		thread.join();
+	}
+	for(auto &thread : this->session_from_client_pump_workers){
+		thread.join();
+	}
+	for(auto &thread : this->session_to_client_pump_workers){
+		thread.join();
+	}
+
+	for(auto &session : this->sessions){
+		session.second.close_socket();
+	}
+
+	for(auto &pending_session : this->pending_sessions){
+		pending_session.close_socket();
+	}
+
+	if (enet_server != NULL){
+		delete enet_server;
+		enet_server = NULL;
+	}
+}
+
+void Server::pump_pending_sessions(int set){
+	for(auto &pending_session : this->to_pump_pending_sessions[set]){
+		PendingSessionPumpStatus pump_status = pending_session->pump(this->sessions, this->adhocctl_snapshot);
+		switch(pump_status){
+			case PendingSessionPumpStatus::SUCCESS:
+				continue;
+			case PendingSessionPumpStatus::SOCKET_CLOSED:
+			case PendingSessionPumpStatus::TIMEOUT:
+			case PendingSessionPumpStatus::BAD_INIT:
+				this->pending_sessions_to_remove[set].push_back(pending_session);
+				continue;
+			case PendingSessionPumpStatus::SESSION_READY:
+				this->ready_pending_sessions[set].push_back(pending_session);
+				continue;
+		}
+	}
+}
+
+void Server::pump_connect_and_from_clients(int set){
+	for(auto &session : this->sessions_to_pump[set]){
+		SessionPumpStatus pump_status = session->pump_connect();
+		if (pump_status == SessionPumpStatus::TIMEOUT){
+			sessions_to_remove[set].insert(session->get_identifier());
+			continue;
+		}
+
+		pump_status = session->pump_from_client();
+		switch(pump_status){
+			case SessionPumpStatus::TIMEOUT:
+			case SessionPumpStatus::CONNECTED:
+			case SessionPumpStatus::SUCCESS:
+				break;
+			case SessionPumpStatus::SOCKET_CLOSED:
+			case SessionPumpStatus::BAD_DATA_SIZE:
+				this->sessions_to_remove[set].insert(session->get_identifier());
+				break;
+		}
+
+		std::vector<SendListItem> send_list;
+		session->get_send_list(send_list);
+		for(auto &send : send_list){
+			auto send_list_by_session_name = this->send_list[set].find(send.session_name);
+			if (send_list_by_session_name != this->send_list[set].end()){
+				send_list_by_session_name->second.push_back(send);
+			}else{
+				std::list<SendListItem> new_list;
+				new_list.push_back(send);
+				this->send_list[set].insert_or_assign(send.session_name, new_list);
+			}
+		}
+	}
+}
+
+void Server::pump_to_clients(int set){
+	for(auto &session : this->sessions_to_pump[set]){
+		std::string identifier = session->get_identifier();
+		auto to_client = adhocctl_snapshot.clients.find(session->get_from_mac());
+
+		if (config.strict_mode){
+			if (to_client == adhocctl_snapshot.clients.end()){
+				// client left on adhocctl
+				sessions_to_remove[set].insert(identifier);
+				continue;
+			}
+			auto to_game = adhocctl_snapshot.games.find(to_client->second.game_code);
+			auto to_group = to_game->second.groups.find(to_client->second.group_key);
+			if (to_group->second.channel < 0){
+				// non grouped clients do not get data
+				continue;
+			}
+		}
+
+		DataQueueStatus queue_status = DataQueueStatus::SUCCESS;
+		for(auto &send_list_set : this->send_list){
+			auto my_send_list = send_list_set.find(identifier);
+			if (my_send_list == send_list_set.end()){
+				continue;
+			}
+			for(auto &send : my_send_list->second){
+				auto from_client = adhocctl_snapshot.clients.find(send.from_mac);
+				if (config.strict_mode){
+					if (from_client == adhocctl_snapshot.clients.end()){
+						// the source client not found on adhocctl
+						continue;
+					}
+					if (from_client->second.game_code != to_client->second.game_code || from_client->second.group_key != to_client->second.group_key){
+						// the source client is not in the same group
+						continue;
+					}
+				}
+
+				DataQueueStatus queue_status = session->queue_send(send.data);
+				if (queue_status == DataQueueStatus::MAX_DATA_REACHED){
+					sessions_to_remove[set].insert(identifier);
+					break;
+				}
+			}
+			if (queue_status == DataQueueStatus::MAX_DATA_REACHED){
+				break;
+			}
+		}
+		if (queue_status == DataQueueStatus::MAX_DATA_REACHED){
+			continue;
+		}
+
+		SessionPumpStatus pump_status = session->pump_to_client();
+		if (pump_status == SessionPumpStatus::SOCKET_CLOSED){
+			sessions_to_remove[set].insert(identifier);
+			break;
+		}
+	}
+}
+
+ServerPumpStatus Server::pump(){
+	if (this->sock_fd == -1){
+		return ServerPumpStatus::LISTEN_SOCK_DEAD;
+	}
+
+	if (addr_family == AddrFamily::IPV6 && enet_server == NULL){
+		return ServerPumpStatus::LISTEN_SOCK_DEAD;
+	}
+
+	// create pending sessions from accept
+	while(true){
+		std::string peer_addr;
+		uint16_t peer_port;
+		int accept_status = native_accept(this->sock_fd, &peer_addr, &peer_port);
+
+		if (accept_status == -1){
+			int error = native_get_last_socket_error();
+			if (native_error_is_would_block(error)){
+				break;
+			}
+			if (native_error_is_emfile(error)){
+				LOG_TS("%s: warning, new relay connection dropped as system limit has been reached\n", __func__);
+				break;
+			}
+			LOG_TS("%s: failed accepting connection, 0x%x\n", __func__, error);
+			native_close(this->sock_fd);
+			this->sock_fd = -1;
+			return ServerPumpStatus::LISTEN_SOCK_DEAD;
+		}
+
+		if (this->pending_sessions.size() + this->sessions.size() >= this->config.max_num_sessions){
+			LOG_TS("%s: warning, new relay connection from %s dropped as maximum number of sessions (%d) has been reached\n", __func__, peer_addr.c_str(), config.max_num_sessions);
+			native_close(accept_status);
+			continue;
+		}
+
+		pending_sessions.emplace_back(accept_status, peer_addr, peer_port, &this->config, (aemu_postoffice_enet::BasicEnetClient *)NULL);
+	}
+
+	while(enet_server != NULL){
+		std::string peer_addr;
+		int peer_port;
+		aemu_postoffice_enet::EnetAcceptStatus status;
+
+		int ref = enet_server->accept(peer_addr, peer_port, status);
+		if (status == aemu_postoffice_enet::EnetAcceptStatus::NO_PEER){
+			break;
+		}
+		if (status != aemu_postoffice_enet::EnetAcceptStatus::SUCCESS){
+			LOG("%s: enet accept error %d\n", __func__, status);
+			return ServerPumpStatus::LISTEN_SOCK_DEAD;
+		}
+
+		pending_sessions.emplace_back(ref, peer_addr, peer_port, &this->config, enet_server);
+	}
+
+	if (pending_sessions.size() == 0 && sessions.size() == 0){
+		return ServerPumpStatus::IDLE;
+	}
+
+	// pump pending sessions in workers
+	for(auto &to_pump_pending_session_set : this->to_pump_pending_sessions){
+		to_pump_pending_session_set.clear();
+	}
+	for(auto &pending_sessions_to_remove_set : this->pending_sessions_to_remove){
+		pending_sessions_to_remove_set.clear();
+	}
+	for(auto &ready_pending_sessions_set : this->ready_pending_sessions){
+		ready_pending_sessions_set.clear();
+	}
+	for(auto &sessions_to_remove_set : this->sessions_to_remove){
+		sessions_to_remove_set.clear();
+	}
+
+	int i = 0;
+	for(auto &pending_session : this->pending_sessions){
+		int worker = i % this->pending_sessions_pump_workers.size();
+		this->to_pump_pending_sessions[worker].push_back(&pending_session);
+		i++;
+	}
+
+	for(auto &sema : this->pending_sessions_pump_worker_semas){
+		sema.release();
+	}
+	for(auto &sema : this->pending_sessions_pump_worker_done_semas){
+		sema.acquire();
+	}
+
+	// process pumping result
+	for(auto &ready_pending_sessions_set : this->ready_pending_sessions){
+		for(auto &ready_session : ready_pending_sessions_set){
+			Session new_session = ready_session->create_session(this->sessions);
+			std::string identifier = new_session.get_identifier();
+			auto old_session = this->sessions.find(identifier);
+			bool replaced = false;
+			if (old_session != this->sessions.end()){
+				LOG_TS("%s: replacing session %s from %s by session from %s\n", __func__, identifier.c_str(), old_session->second.get_client_addr().c_str(), new_session.get_client_addr().c_str());
+				old_session->second.close_socket();
+				replaced = true;
+			}
+
+			std::string mac = new_session.get_from_mac();
+			auto count = per_mac_session_count.find(mac);
+			if (count == per_mac_session_count.end()){
+				per_mac_session_count[mac] = 1;
+			} else if (!replaced){
+				if (count->second >= config.max_num_sessions_per_mac){
+					this->pending_sessions_to_remove[0].push_back(ready_session);
+					new_session.close_socket();
+
+					// this is peer killing, we kill the connect if the accept pops the limit
+					std::string peer_identifier = new_session.get_peer_identifier();
+					if (peer_identifier != std::string("")){
+						sessions_to_remove[0].insert(peer_identifier);
+					}
+
+					continue;
+				}
+				count->second = count->second + 1;
+			}
+
+			this->sessions.insert_or_assign(identifier, new_session);
+			this->pending_sessions_to_remove[0].push_back(ready_session);
+		}
+	}
+
+	for(auto &pending_sessions_to_remove_set : this->pending_sessions_to_remove){
+		for(auto &to_remove_pending_session : pending_sessions_to_remove_set){
+			for(auto itr = this->pending_sessions.begin();itr != this->pending_sessions.end();itr++){
+				if (&(*itr) == to_remove_pending_session){
+					this->pending_sessions.erase(itr);
+					break;
+				}
+			}
+		}
+	}
+
+	// pump data from clients
+	for(auto &sessions_to_pump_set : this->sessions_to_pump){
+		sessions_to_pump_set.clear();
+	}
+
+	i = 0;
+	for(auto &session : this->sessions){
+		int worker = i % this->session_from_client_pump_workers.size();
+		this->sessions_to_pump[worker].push_back(&(session.second));
+		i++;
+	}
+
+	for(auto &sema : this->session_from_client_pump_worker_semas){
+		sema.release();
+	}
+
+	for(auto &sema : this->session_from_client_pump_worker_done_semas){
+		sema.acquire();
+	}
+
+	// pump data top clients
+	for(auto &sema : this->session_to_client_pump_worker_semas){
+		sema.release();
+	}
+
+	for(auto &sema : this->session_to_client_pump_worker_done_semas){
+		sema.acquire();
+	}
+
+	// clear send list
+	for(auto &send_list_set : this->send_list){
+		send_list_set.clear();
+	}	
+
+	// remove sessions
+	for(auto &sessions_to_remove_set : this->sessions_to_remove){
+		for(auto &session_name : sessions_to_remove_set){
+			auto session = this->sessions.find(session_name);
+			if (session == this->sessions.end()){
+				continue;
+			}
+			session->second.close_socket();
+
+			auto reduce_count = [this] (std::string mac) {
+				auto count = per_mac_session_count.find(mac);
+				count->second = count->second - 1;
+				if (count->second == 0){
+					per_mac_session_count.erase(count);
+				}
+			};
+			reduce_count(session->second.get_from_mac());
+
+			std::string peer_identifier = session->second.get_peer_identifier();
+			LOG_TS("%s: removing %s of %s\n", __func__, session_name.c_str(), session->second.get_client_addr().c_str());
+			this->sessions.erase(session);
+			if (peer_identifier != std::string("")){
+				auto peer_session = this->sessions.find(peer_identifier);
+				if (peer_session != this->sessions.end()){
+					peer_session->second.close_socket();
+					reduce_count(peer_session->second.get_from_mac());
+					LOG_TS("%s: removing %s of %s by peer relation\n", __func__, peer_identifier.c_str(), peer_session->second.get_client_addr().c_str());
+					this->sessions.erase(peer_session);
+				}
+			}
+		}
+	}
+
+	return ServerPumpStatus::SUCCESS;
+}
+
+void Server::update_adhocctl_data(const aemu_postoffice_adhocctl_server::snapshot &snapshot){
+	this->adhocctl_snapshot = snapshot;
+}
+
+void Server::set_config(const struct config &config){
+	const struct config old_config = this->config;
+	this->config = config;
+
+	// these cannot be changed runtime
+	this->config.ip_addr = old_config.ip_addr;
+	this->config.port = old_config.port;
+	this->config.num_threads = old_config.num_threads;
+}
+
+struct snapshot Server::get_snapshot(){
+	struct snapshot ret;
+	for (auto session = sessions.begin();session != sessions.end();session++){
+		std::string mac = session->second.get_from_mac();
+
+		auto client_entry = ret.clients.find(mac);
+		if (client_entry == ret.clients.end()){
+			struct snapshot_client new_client;
+			new_client.mac = mac;
+			new_client.ip = session->second.get_client_addr();
+			new_client.port = session->second.get_client_port();
+			ret.clients.insert_or_assign(mac, new_client);
+			client_entry = ret.clients.find(mac);
+		}
+
+		uint16_t from_port = session->second.get_from_port();
+		SessionMode session_mode = session->second.get_session_mode();
+		switch(session_mode){
+			case SessionMode::PDP:
+				client_entry->second.pdp_ports.push_back(from_port);
+				break;
+			case SessionMode::PTP_LISTEN:
+				client_entry->second.ptp_listen_ports.push_back(from_port);
+				break;
+			case SessionMode::PTP_CONNECT:
+				client_entry->second.ptp_connect_ports.push_back(from_port);
+				break;
+			case SessionMode::PTP_ACCEPT:
+				client_entry->second.ptp_accept_ports.push_back(from_port);
+				break;
+			default:
+				LOG("%s: bad session mode %d, debug this\n", __func__, session_mode);
+				exit(1);
+		}
+	}
+
+	return ret;
+}
+
+}

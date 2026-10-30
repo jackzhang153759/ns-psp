@@ -1,0 +1,1001 @@
+diff --git a/Common/MemArenaHorizon.cpp b/Common/MemArenaHorizon.cpp
+index f3e1f26..d3ae641 100644
+--- a/Common/MemArenaHorizon.cpp
++++ b/Common/MemArenaHorizon.cpp
+@@ -79,8 +79,12 @@ void *MemArena::CreateView(s64 offset, size_t size, void *base) {
+ 	}
+ 	Result rc = svcMapProcessMemory(base, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
+ 	if (R_FAILED(rc)) {
+-		printf("Fatal error creating the view... base: %p offset: %p size: %p src: %p err: %d\n",
+-			   (void *)base, (void *)offset, (void *)size, (void *)(memoryCodeBase + offset), rc);
++		printf("Fatal error creating the view... base: %p offset: %p size: %p src: %p err: %d "
++			   "baseRange=%p..%p codeRange=%p..%p backRange=%p..%p\n",
++			   (void *)base, (void *)offset, (void *)size, (void *)(memoryCodeBase + offset), rc,
++			   (void *)memoryBase, (void *)(memoryBase + PSP_ADDRESS_SPACE_SIZE),
++			   (void *)memoryCodeBase, (void *)(memoryCodeBase + PSP_BACKING_STORE_SIZE),
++			   (void *)memorySrcBase, (void *)(memorySrcBase + PSP_BACKING_STORE_SIZE));
+ 		return nullptr;
+ 	}
+ 
+diff --git a/Core/Compatibility.cpp b/Core/Compatibility.cpp
+index 4d0cba8..17d300e 100644
+--- a/Core/Compatibility.cpp
++++ b/Core/Compatibility.cpp
+@@ -28,6 +28,10 @@
+ #include "Core/Config.h"
+ #include "Core/System.h"
+ 
++void Compatibility::Reset() {
++	Clear();
++}
++
+ void Compatibility::Load(const std::string &gameID) {
+ 	Clear();
+ 
+diff --git a/Core/Compatibility.h b/Core/Compatibility.h
+index 1908a7b..0ee07b6 100644
+--- a/Core/Compatibility.h
++++ b/Core/Compatibility.h
+@@ -151,6 +151,12 @@ class Compatibility {
+ 
+ 	void Load(const std::string &gameID);
+ 
++	// Drops every flag and returns to the state of a machine with no game loaded. Used when the
++	// emulator goes back to something that is not a title (the XMB), where a game's flags must not
++	// linger. Note this is not the same as Load(""): Load() still honours the "ALL" debug shortcut
++	// in compat.ini, which forces flags on regardless of the game ID - see CheckSetting().
++	void Reset();
++
+ 	const std::string &GetActiveFlagsString() const {
+ 		return activeList_;
+ 	}
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+index 144a2e1..3d50e24 100644
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -222,6 +222,18 @@ void __DisplayInit() {
+ 	__KernelRegisterWaitTypeFuncs(WAITTYPE_VBLANK, __DisplayVblankBeginCallback, __DisplayVblankEndCallback);
+ }
+ 
++// Called when a new game starts (see CPU_Init). The frame timing above is deliberately
++// reset on boot, but a game launched from the XMB's UMD slot goes through a different
++// path and can inherit the shell's timing baseline, which leaves the first frames
++// throttled against stale values. Clearing it here makes the new title start clean.
++void __DisplayResetFrameTiming() {
++	curFrameTime = 0.0;
++	nextFrameTime = 0.0;
++	lastFrameTime = 0.0;
++	lastFlipHostTime = 0.0;
++	wasPaused = true;
++}
++
+ struct GPUStatistics_v0 {
+ 	int firstInts[11];
+ 	double msProcessingDisplayLists;
+@@ -478,6 +490,25 @@ static void DoFrameTiming(bool throttle, bool *skipFrame, float scaledTimestep,
+ 		}
+ 	}
+ 
++#if PPSSPP_PLATFORM(SWITCH)
++	// Diagnose "game launched from the XMB runs at 55-75% while the same game launched
++	// from the PPSSPP menu is full speed". Only fires on repeated slow frames, so it
++	// stays quiet in normal play.
++	if (throttle && lastFrameTime != 0.0 && scaledTimestep > 0.0f) {
++		static double lastSlowLog = 0.0;
++		const double actual = curFrameTime - lastFrameTime;
++		const double now2 = time_now_d();
++		if (actual > scaledTimestep * 1.25 && now2 - lastSlowLog > 3.0) {
++			lastSlowLog = now2;
++			printf("[perf] slow frame actual=%.2fms budget=%.2fms limit=%d framerate=%d "
++			       "fastForward=%d fpsLimit=%d frameSkip=%d autoSkip=%d\n",
++				actual * 1000.0, scaledTimestep * 1000.0, FrameTimingLimit(), framerate,
++				(int)PSP_CoreParameter().fastForward, (int)PSP_CoreParameter().fpsLimit,
++				g_Config.iFrameSkip, (int)autoFrameSkip);
++		}
++	}
++#endif
++
+ 	lastFrameTime = nextFrameTime;
+ 	wasPaused = false;
+ }
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+index edb3bc6..739e008 100644
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -38,6 +38,8 @@ void __DisplaySetWasPaused();
+ // speeds, and the netplay/achievement restrictions have all had their say. 0 means unlimited.
+ int __DisplayGetFrameTimingLimit();
+ 
++void __DisplayResetFrameTiming();
++
+ void Register_sceDisplay_driver();
+ void __DisplayWaitForVblanks(const char* reason, int vblanks, bool callbacks = false);
+ 
+diff --git a/Core/HLE/sceKernelModule.cpp b/Core/HLE/sceKernelModule.cpp
+index 35d4a9f..f5ec52c 100644
+--- a/Core/HLE/sceKernelModule.cpp
++++ b/Core/HLE/sceKernelModule.cpp
+@@ -33,6 +33,7 @@
+ #include "Common/Data/Text/StringWriter.h"
+ 
+ #include "Core/Config.h"
++#include "Core/Compatibility.h"
+ #include "Core/Core.h"
+ #include "Core/HLE/HLE.h"
+ #include "Core/HLE/FunctionWrappers.h"
+@@ -64,6 +65,7 @@
+ #include "Core/HLE/sceKernel.h"
+ #include "Core/HLE/sceKernelModule.h"
+ #include "Core/HLE/sceKernelThread.h"
++#include "Core/HLE/sceUmd.h"
+ #include "Core/HLE/sceKernelMemory.h"
+ #include "Core/HLE/sceMpeg.h"
+ #include "Core/HLE/scePsmf.h"
+@@ -1121,6 +1123,19 @@ enum : u32 {
+ // than a game), and reset on the next __KernelLoadExec. See ShouldHLEModuleForLoad below.
+ static bool g_runningVSH = false;
+ 
++bool __KernelIsRunningVSH() {
++	return g_runningVSH;
++}
++
++bool __KernelIsShellForeground() {
++	// g_runningVSH alone is not the answer: it stays set once the shell has started (HLE module
++	// loading depends on it, so we don't touch its meaning) and says nothing about who is in the
++	// foreground. Combine it with the host's boot target, which is what the pause menu and
++	// GameInfoCache already use to describe the running program: while a game launched from the
++	// shell's UMD slot runs, that points at the disc image, not at vshmain.prx.
++	return g_runningVSH && equalsNoCase(PSP_CoreParameter().fileToStart.GetFilename(), "vshmain.prx");
++}
++
+ // A few flash0 modules (VSH's own bridge/UI/utility libraries) should only ever be genuinely
+ // loaded - rather than faked via any HLE implementation we may have for them - once we know
+ // we're actually running the VSH. A regular game never legitimately loads these, so this only
+@@ -1572,6 +1587,9 @@ static PSPModule *__KernelLoadELFFromPtr(const u8 *ptr, size_t elfSize, u32 load
+ 	// below was skipped and the shell ran with none of its support modules loaded.
+ 	if ((module->nm.attribute & PSP_MODULE_VSH_MODE) != 0 || equals(modinfo->name, "vsh_module")) {
+ 		g_runningVSH = true;
++		// The shell comes up with an empty disc drive; users insert an image from the
++		// pause menu. Without this the menu would offer "Eject UMD" straight away.
++		__UmdNoDiscAtBoot();
+ 		INFO_LOG(Log::sceModule, "VSH mode module detected: %s", modinfo->name);
+ 	}
+ 
+@@ -2177,6 +2195,179 @@ void __KernelLoadReset() {
+ 	__KernelInit();
+ }
+ 
++// The host describes "the program currently being run" through PSP_CoreParameter().fileToStart and
++// .fileType: the pause menu keys savestate support off the filename, and GameInfoCache derives the
++// title/ID/region from the path. Booting a game from PPSSPP's own menu sets these up in
++// Core/System.cpp, but booting one from the XMB happens through sceKernelLoadExec, which until now
++// left both fields pointing at the shell (flash0:/vsh/module/vshmain.prx). The running title was
++// therefore presented as a VSH program - no savestate slots, "vshmain.prx" in the game info dialog -
++// and none of the per-game setup done on the menu launch path ever ran.
++//
++// Both fields are CPU-thread-owned (PSP_Shutdown clears them from there - see the note in
++// Core/Debugger/WebSocket/GameSubscriber.cpp) and __KernelLoadExecFromPtr is reached from HLE code
++// on the CPU thread, so writing them here respects that ownership.
++
++// Disc ID whose title the host has adopted; empty while the shell is the foreground program.
++static std::string g_adoptedDiscID;
++
++// The shell's identity from before the first adoption, so a LoadExec back into vshmain can hand
++// the pause menu the shell again instead of a disc title that no longer applies.
++static bool g_haveShellIdentity = false;
++static Path g_shellFileToStart;
++static IdentifiedFileType g_shellFileType = IdentifiedFileType::UNKNOWN;
++
++// True when a LoadExec target is the shell itself - the emulated PSP is going back to the XMB.
++//
++// The filename is the most reliable signal at this point. vshmain.prx is the only entry point the
++// shell is ever entered through, and the module attributes can't be consulted yet because
++// __KernelLoadModule() hasn't run (the VSH-mode check lives inside it). The attribute would also
++// be the wrong test: g_runningVSH stays true for the whole session and says nothing about which
++// program is in the foreground, which is exactly the confusion we're fixing here.
++static bool IsShellLoadExecTarget(const char *filename) {
++	if (!filename || !*filename) {
++		return false;
++	}
++	return equalsNoCase(Path(filename).GetFilename(), "vshmain.prx");
++}
++
++// True when the LoadExec target is a program on the emulated disc, i.e. a title being started from
++// the shell's UMD slot. The prefix test matters: a homebrew EBOOT started by the shell off the
++// memory stick must not be mistaken for a disc title just because a disc happens to be in the
++// drive - the drive's PARAM.SFO would then give the homebrew the wrong game's identity.
++static bool IsDiscLoadExecTarget(const char *filename) {
++	return filename && startsWithNoCase(filename, "disc0:");
++}
++
++// Mirrors what the "start a game from PPSSPP's menu" path does before booting it, so that a title
++// launched from the shell's UMD slot ends up in the exact same host state. Called once per disc.
++static void AdoptDiscTitleForHost(const std::string &discID) {
++	// Only the shell-booted case needs any of this. When the game was started from PPSSPP's own
++	// menu, Core/System.cpp and Load_PSP_ISO() already did all of it before the emulated PSP
++	// booted, and fileToStart already names the real image. Rewriting it there would throw away
++	// the path that savestates, the symbol map and the game info cache are all keyed on - the
++	// "adopt from the disc" fallback path below is not good enough to replace a real one.
++	const Path &currentTarget = PSP_CoreParameter().fileToStart;
++	if (!currentTarget.empty() && !equalsNoCase(currentTarget.GetFilename(), "vshmain.prx")) {
++		return;
++	}
++
++	if (g_adoptedDiscID == discID) {
++		// This disc's title is already adopted: either the same game re-exec'ing itself or loading
++		// another file off its own disc. Re-running the steps below would be wasteful, and
++		// InitMemorySizeForGame() specifically must not change the memory size mid-session.
++		return;
++	}
++
++	// Save the shell identity before the first adoption so RestoreShellTitleForHost() can undo this.
++	if (!g_haveShellIdentity) {
++		g_shellFileToStart = PSP_CoreParameter().fileToStart;
++		g_shellFileType = PSP_CoreParameter().fileType;
++		g_haveShellIdentity = true;
++	}
++
++	// The three per-game initializations that only the menu launch path performed. Without the
++	// compat flags, games like either God of War stay on the "wrong" rendering/framerate path
++	// (RequireBufferedRendering, GoWFramerateHack60); without the game config, none of the
++	// per-game settings apply.
++	PSP_CoreParameter().compat.Load(discID);
++
++	// These three are only honoured while the core/GPU is being set up. This runs after that, so
++	// a per-game value would be half-applied: bFastMemory is read per instruction while the JIT
++	// compiles, iCpuCore picks the core at boot and iGPUBackend is already instantiated. Keep the
++	// values this session actually booted with, and report the mismatch so it's visible.
++	const int bootCpuCore = g_Config.iCpuCore;
++	const bool bootFastMemory = g_Config.bFastMemory;
++	const int bootGPUBackend = g_Config.iGPUBackend;
++
++	g_Config.LoadGameConfig(discID);
++
++	if (g_Config.iCpuCore != bootCpuCore || g_Config.bFastMemory != bootFastMemory || g_Config.iGPUBackend != bootGPUBackend) {
++		printf("[boot] game config changes boot-only settings (cpucore %d->%d fastmem %d->%d backend %d->%d); keeping the booted values, restart to apply\n",
++			bootCpuCore, g_Config.iCpuCore, (int)bootFastMemory, (int)g_Config.bFastMemory, bootGPUBackend, g_Config.iGPUBackend);
++		g_Config.iCpuCore = bootCpuCore;
++		g_Config.bFastMemory = bootFastMemory;
++		g_Config.iGPUBackend = bootGPUBackend;
++		// Don't let the values we just forced back leak into the game's ini on the next save -
++		// they're this session's boot values, not something the player chose for this title.
++		g_Config.DoNotSaveSetting(&g_Config.iCpuCore);
++		g_Config.DoNotSaveSetting(&g_Config.bFastMemory);
++	}
++
++	// The memory size is the one boot-only setting we can't just ignore: the RAM mappings were
++	// built for the size g_MemorySize had at Memory::Init(), and InitMemorySizeForGame() can still
++	// raise it (the HD Remaster list sets it directly). There's no way to redo the mappings from
++	// here, so only report it instead of pretending it applied.
++	const u32 bootMemorySize = Memory::g_MemorySize;
++	InitMemorySizeForGame();
++	if (Memory::g_MemorySize != bootMemorySize) {
++		WARN_LOG(Log::Loader, "Game changed the emulated memory size from %u to %u after boot; a restart is needed for it to apply", bootMemorySize, Memory::g_MemorySize);
++		printf("[boot] memory size %u -> %u, needs a restart to apply\n", bootMemorySize, Memory::g_MemorySize);
++	}
++
++	// Point the host at the disc image rather than at the shell's vshmain.prx. GameInfoCache
++	// re-reads the title/ID from this path, which is also what makes the pause menu offer
++	// savestates. If the image path isn't known (e.g. the disc was mounted some other way), fall
++	// back to the disc's boot executable - either way it is no longer "vshmain.prx".
++	const Path &imagePath = GetInsertedUmdPath();
++	PSP_CoreParameter().fileToStart = imagePath.empty() ? Path("disc0:/PSP_GAME/SYSDIR/EBOOT.BIN") : imagePath;
++	// An extracted game directory is a legitimate way to boot too, and the UI gates a few things
++	// (savestates, the GE dump branch) on this value, so report what was actually mounted.
++	PSP_CoreParameter().fileType = (!imagePath.empty() && File::IsDirectory(imagePath))
++		? IdentifiedFileType::PSP_DISC_DIRECTORY : IdentifiedFileType::PSP_ISO;
++	g_adoptedDiscID = discID;
++
++	// Posted last, on purpose: the UI handler (EmuScreen) reads fileToStart to follow the switch,
++	// so the field has to be final before the message can be observed. Load_PSP_ISO() can post it
++	// earlier only because it hasn't booted anything yet.
++	System_PostUIMessage(UIMessage::CONFIG_LOADED);
++
++	// fileType is the actual value, not a hardcoded one: it can legitimately be PSP_DISC_DIRECTORY
++	// for an extracted game, and this line is what gets grepped in device logs.
++	printf("[boot] adopted disc title id='%s' fileType=%d compat='%s' gameConfig=%d vsh=%d path='%s'\n",
++		discID.c_str(),
++		(int)PSP_CoreParameter().fileType,
++		PSP_CoreParameter().compat.GetActiveFlagsString().c_str(),
++		g_Config.HasGameConfig(discID) ? 1 : 0,
++		g_runningVSH ? 1 : 0,
++		PSP_CoreParameter().fileToStart.ToVisualString().c_str());
++}
++
++// LoadExec back into the XMB: undo AdoptDiscTitleForHost() so the pause menu and the game info
++// dialog describe the shell again, and drop the disc's compat flags.
++static void RestoreShellTitleForHost() {
++	if (g_adoptedDiscID.empty()) {
++		return;  // No title adopted - the shell identity is already the current one.
++	}
++
++	if (g_haveShellIdentity) {
++		PSP_CoreParameter().fileToStart = g_shellFileToStart;
++		PSP_CoreParameter().fileType = g_shellFileType;
++	}
++	g_adoptedDiscID.clear();
++
++	// Compat flags are read live by the GPU and the pause menu, so the game's flags must not
++	// outlive the game: GoWFramerateHack60 et al. would otherwise still be applied while the XMB
++	// runs. Reset() (not Load("")): Load() re-reads compat.ini and still honours its "ALL" debug
++	// shortcut, which forces a flag on for every game ID - including none at all.
++	PSP_CoreParameter().compat.Reset();
++
++	// LoadExec back into the shell doesn't go through PSP_Shutdown, so nothing has dropped the
++	// game-specific config mode yet. Config::Save() writes every PerGame setting into gameId_'s
++	// ini whenever IsGameSpecific() - without this, the next title's settings (keymaps included)
++	// land in this one's file.
++	if (g_Config.IsGameSpecific()) {
++		g_Config.UnloadGameConfig();
++	}
++
++	// Let the UI follow the switch back, for the same reason the adopt path posts it: the shell is
++	// the program being described again. Posted after the fields are final.
++	System_PostUIMessage(UIMessage::CONFIG_LOADED);
++
++	printf("[boot] restored shell title fileType=%d path='%s'\n",
++		(int)PSP_CoreParameter().fileType,
++		PSP_CoreParameter().fileToStart.ToVisualString().c_str());
++}
++
+ // Shared by __KernelLoadExec (loading from a file) and __KernelLoadExecFromBuffer (loading
+ // from a buffer already in RAM, as used by the VSH's USB/WLAN game-push feature) - everything
+ // past the point where we have the executable's bytes in hand.
+@@ -2205,6 +2396,31 @@ static bool __KernelLoadExecFromPtr(MIPSState * mips, const u8 *data, size_t siz
+ 
+ 	__KernelLoadReset();
+ 
++	// A title launched from the XMB's UMD slot needs the disc's PARAM.SFO refreshed here:
++	// the shell's own info (vshmain) is still cached, and without a disc ID the game gets
++	// no shader cache and no per-game settings.
++	// The host side has to follow, too: it still describes the shell (vshmain.prx), which hides the
++	// savestate slots and leaves the game's compat flags and per-game config unloaded. Note the
++	// shell check comes first on purpose - when going back to the XMB the game's disc is usually
++	// still mounted, so a successful LoadParamSFOFromDisc() there would wrongly re-adopt the title
++	// we are trying to get rid of.
++	if (IsShellLoadExecTarget(filename)) {
++		RestoreShellTitleForHost();
++	} else if (IsDiscLoadExecTarget(filename) && pspFileSystem.GetSystem("disc0:")) {
++		if (LoadParamSFOFromDisc()) {
++			printf("[cache] LoadExec: disc ID is now '%s'\n", g_paramSFO.GetDiscID().c_str());
++			AdoptDiscTitleForHost(g_paramSFO.GetDiscID());
++			// The GPU was brought up while the shell was running, so point its shader cache
++			// at this title now. Doing it in CPU_Init is too early - at that point g_paramSFO
++			// still reports the shell's ID (VSHMxxxxx) and nothing is ever loaded.
++			if (gpu) {
++				gpu->ReloadShaderCache(g_paramSFO.GetDiscID());
++			}
++		} else {
++			printf("[cache] LoadExec: no PARAM.SFO on disc0:\n");
++		}
++	}
++
+ 	PSPModule *module = __KernelLoadModule((u8 *)data, size, 0, filename, error_string);
+ 
+ 	if (!module || module->isFake) {
+diff --git a/Core/HLE/sceKernelModule.h b/Core/HLE/sceKernelModule.h
+index 0ba6fc3..d468b25 100644
+--- a/Core/HLE/sceKernelModule.h
++++ b/Core/HLE/sceKernelModule.h
+@@ -237,6 +237,13 @@ u32 __KernelGetModuleGP(SceUID module);
+ bool KernelModuleIsKernelMode(SceUID module);
+ bool __KernelLoadGEDump(MIPSState *mips, std::string_view base_filename, std::string *error_string);
+ bool __KernelLoadExec(MIPSState *mips, const char *filename, u32 paramPtr, std::string *error_string);
++// The VSH (the XMB) is what's running, not a game it launched.
++bool __KernelIsRunningVSH();
++// The shell is actually in the foreground, i.e. no title booted from its UMD slot is running.
++// Unlike __KernelIsRunningVSH() this goes false while such a game runs, so UI that would disturb
++// the mounted disc (Insert/Eject UMD) can gate on it. See the definition for why g_runningVSH
++// alone can't answer this.
++bool __KernelIsShellForeground();
+ // Exposed so sceVshBridge can reuse it directly for vshKernelLoadModuleBufferVSH, matching JPCSP.
+ SceUID sceKernelLoadModuleBufferUsbWlan(u32 size, u32 bufPtr, u32 flags, u32 lmoptionPtr);
+ bool __KernelLoadExecFromBuffer(MIPSState *mips, const u8 *data, size_t size, u32 paramPtr, std::string *error_string);
+diff --git a/Core/HLE/sceUmd.cpp b/Core/HLE/sceUmd.cpp
+index 659fda0..d139992 100644
+--- a/Core/HLE/sceUmd.cpp
++++ b/Core/HLE/sceUmd.cpp
+@@ -22,6 +22,10 @@
+ #include "Common/Serialize/SerializeFuncs.h"
+ #include "Common/Serialize/SerializeMap.h"
+ #include "Core/Loaders.h"
++#include "Core/ELF/ParamSFO.h"
++#include "Core/PSPLoaders.h"
++#include "GPU/GPU.h"
++#include "GPU/GPUCommon.h"
+ #include "Core/MemMap.h"
+ #include "Core/System.h"
+ #include "Core/CoreTiming.h"
+@@ -58,6 +62,15 @@ static std::map<SceUID, u64> umdPausedWaits;
+ bool g_UMDReplacePermit = false;
+ bool UMDInserted = true;
+ 
++// Path of the image in the drive, for the host side (see GetInsertedUmdPath()). Deliberately not
++// reset by __UmdInit(): the HLE modules are torn down on every LoadExec, but the disc stays in
++// the drive across a LoadExec - the game that boots from it needs to find this path afterwards.
++static Path umdImagePath;
++
++const Path &GetInsertedUmdPath() {
++	return umdImagePath;
++}
++
+ struct PspUmdInfo {
+ 	u32_le size;
+ 	u32_le type;
+@@ -477,13 +490,36 @@ void __UmdReplace(const Path &filepath) {
+ 		return;
+ 	}
+ 
++	// Remember what's in the drive: a LoadExec out of the shell's UMD slot later has to tell the
++	// host which disc image the game came from.
++	umdImagePath = filepath;
++
+ 	Achievements::ChangeUMD(filepath, fileLoader);
+ 
++	// Read the disc's PARAM.SFO so the rest of the emulator knows which game this is.
++	// A title booted from the shell's UMD slot otherwise has no disc ID at all, which
++	// leaves it without a shader cache (every shader compiles on the fly) and without
++	// its per-game settings.
++	//
++	// Note: do NOT pull in the shader cache here. At this point disc0: may still report
++	// the previous disc (observed: it reported another title's ID), so we'd load the wrong
++	// file and block for seconds. The shader cache is loaded at LoadExec instead, where the
++	// ID is verified to be this disc's.
++	if (LoadParamSFOFromDisc()) {
++		printf("[cache] UmdReplace: disc ID is '%s'\n", g_paramSFO.GetDiscID().c_str());
++	}
++
+ 	UMDInserted = false;
+ 	// Wake any threads waiting for the disc to be removed.
+ 	UmdWakeThreads();
+ 
+ 	CoreTiming::ScheduleEvent(usToCycles(200*1000), umdInsertChangeEvent, 0); // Wait sceUmdCheckMedium call
++	// The disc is physically in the drive already, so make it visible right away. The
++	// scheduled event above exists to emulate the PSP's medium check, but while the
++	// emulator is paused (XMB pause menu) it never runs and the shell would keep
++	// reporting an empty drive until the user resumes.
++	UMDInserted = true;
++	UmdWakeThreads();
+ 	// TODO Is this always correct if UMD was not activated?
+ 	u32 notifyArg = PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED;
+ 	if (driveCBId != 0)
+@@ -494,6 +530,65 @@ bool getUMDReplacePermit() {
+ 	return g_UMDReplacePermit;
+ }
+ 
++void __UmdEject() {
++	// A disc still waiting to go in comes back out without the shell ever hearing of it.
++	// __UmdReplace schedules the pending insert with userdata 0, so match that here -
++	// otherwise the queued insert fires anyway and the disc reappears after ejecting.
++	const bool insertPending = CoreTiming::UnscheduleEvent(umdInsertChangeEvent, 0) != 0;
++	if (!UMDInserted && !insertPending) {
++		return;
++	}
++	pspFileSystem.Unmount("umd0:");
++	pspFileSystem.Unmount("umd1:");
++	pspFileSystem.Unmount("umd:");
++	pspFileSystem.Unmount("disc0:");
++	umdImagePath.clear();
++	if (!UMDInserted) {
++		return;
++	}
++
++	UMDInserted = false;
++	UmdWakeThreads();
++	if (driveCBId != 0)
++		__KernelNotifyCallback(driveCBId, PSP_UMD_NOT_PRESENT | PSP_UMD_CHANGED);
++}
++
++bool __UmdIsInserted() {
++	// Counting a disc that's on its way in, which can't finish while emulation is paused.
++	return UMDInserted || CoreTiming::IsScheduled(umdInsertChangeEvent);
++}
++
++// The PSP boots the XMB with an empty drive, but UMDInserted defaults to true because
++// games are normally started from a disc image. Clear it when the VSH is loaded so the
++// pause menu offers "Insert UMD" first, like a real console with no disc.
++void __UmdNoDiscAtBoot() {
++	// A disc the user put in the drive stays there when the shell is re-entered: coming back
++	// from a game is another vshmain LoadExec, but disc0: is still mounted, so clearing the
++	// slot here would make the pause menu offer "Insert UMD" for a disc that is in the drive -
++	// and re-launching the title from its icon would then fall back to a disc0:/ boot path
++	// because the image path is gone. Only the first shell boot, with an empty drive, clears.
++	if (!umdImagePath.empty()) {
++		return;
++	}
++	UMDInserted = false;
++	// The drive is empty, so there is no image for the host to describe either. (Not reset in
++	// __UmdInit: a LoadExec into a game must still see the disc it is about to boot from.)
++	umdImagePath.clear();
++	if (umdInsertChangeEvent != -1) {
++		CoreTiming::UnscheduleEvent(umdInsertChangeEvent, 0);
++	}
++}
++
++// Called from CPU_Shutdown. The mounts are dropped by pspFileSystem.Shutdown(), so all that's
++// left is to forget that this session ever had a disc: umdImagePath is what tells
++// __UmdNoDiscAtBoot() whether the drive is really occupied, and a stale path from a previous
++// game would make the next shell boot believe a disc that isn't mounted is still in the drive.
++// UMDInserted goes back to its module-level default so a direct game boot still sees a disc.
++void __UmdClearHostState() {
++	umdImagePath.clear();
++	UMDInserted = true;
++}
++
+ static u32 sceUmdReplaceProhibit() {
+ 	if (g_UMDReplacePermit) {
+ 		g_UMDReplacePermit = false;
+diff --git a/Core/HLE/sceUmd.h b/Core/HLE/sceUmd.h
+index d465490..07a44c3 100644
+--- a/Core/HLE/sceUmd.h
++++ b/Core/HLE/sceUmd.h
+@@ -39,6 +39,19 @@ void __UmdInit();
+ void __UmdDoState(PointerWrap &p);
+ 
+ void __UmdReplace(const Path &filepath);
++void __UmdEject();
++bool __UmdIsInserted();
++void __UmdNoDiscAtBoot();
+ bool getUMDReplacePermit();
+ 
++// The host-side path of the image currently sitting in the emulated drive. Empty when the drive
++// is empty. A title booted from the shell's UMD slot needs this so the host can point
++// PSP_CoreParameter().fileToStart at the disc image instead of at the shell's vshmain.prx (that
++// field is what GameInfoCache and the pause menu use to describe "the program being run").
++const Path &GetInsertedUmdPath();
++
++// Forgets the drive contents for the host side. Called when the whole emulated machine goes away
++// (CPU_Shutdown), since the mounts are dropped there without the individual eject path running.
++void __UmdClearHostState();
++
+ void Register_sceUmdUser();
+diff --git a/Core/HW/MediaEngine.cpp b/Core/HW/MediaEngine.cpp
+index 5782f90..0aea683 100644
+--- a/Core/HW/MediaEngine.cpp
++++ b/Core/HW/MediaEngine.cpp
+@@ -554,7 +554,15 @@ bool MediaEngine::setVideoStream(int streamNum, bool force) {
+ 
+ 		AVDictionary *opt = nullptr;
+ 		// Allow ffmpeg to use any number of threads it wants.  Without this, it doesn't use threads.
++#if PPSSPP_PLATFORM(SWITCH)
++		// One thread: every extra decoder thread keeps its own frame buffers, and on the
++		// Switch the JIT's code-memory mappings start failing right after a movie finishes
++		// the file - most likely because the heap has grown into the reserved JIT range.
++		// PMF is only 480x272, single-threaded decoding is fast enough.
++		av_dict_set(&opt, "threads", "1", 0);
++#else
+ 		av_dict_set(&opt, "threads", "0", 0);
++#endif
+ 		int openResult = avcodec_open2(m_pCodecCtx, pCodec, &opt);
+ 		av_dict_free(&opt);
+ 		if (openResult < 0) {
+diff --git a/Core/Loaders.cpp b/Core/Loaders.cpp
+index 287789b..01f2420 100644
+--- a/Core/Loaders.cpp
++++ b/Core/Loaders.cpp
+@@ -348,11 +348,6 @@ Path ResolvePBPFile(const Path &filename) {
+ bool UmdReplace(const Path &filepath, FileLoader **fileLoader, std::string &error) {
+ 	IFileSystem *currentUMD = pspFileSystem.GetSystem("disc0:");
+ 
+-	if (!currentUMD) {
+-		error = "has no disc";
+-		return false;
+-	}
+-
+ 	FileLoader *loadedFile = ConstructFileLoader(filepath);
+ 
+ 	if (!loadedFile || !loadedFile->Exists()) {
+@@ -368,6 +363,16 @@ bool UmdReplace(const Path &filepath, FileLoader **fileLoader, std::string &erro
+ 
+ 	*fileLoader = loadedFile;
+ 
++	// The drive can be empty: the XMB starts without a disc, and its pause menu can
++	// eject one. MountGameISO() mounts a fresh filesystem, so drop whatever is still
++	// mounted (an older disc, or nothing at all) instead of requiring a disc0: first.
++	if (currentUMD) {
++		pspFileSystem.Unmount("umd0:");
++		pspFileSystem.Unmount("umd1:");
++		pspFileSystem.Unmount("umd:");
++		pspFileSystem.Unmount("disc0:");
++	}
++
+ 	switch (fileType) {
+ 	case IdentifiedFileType::PSP_ISO:
+ 	case IdentifiedFileType::PSP_ISO_NP:
+diff --git a/Core/System.cpp b/Core/System.cpp
+index 85a3a74..cc4def5 100644
+--- a/Core/System.cpp
++++ b/Core/System.cpp
+@@ -56,6 +56,9 @@
+ #include "Core/Debugger/SymbolMap.h"
+ #include "Core/System.h"
+ #include "Core/HLE/HLE.h"
++#include "Core/HLE/sceDisplay.h"
++#include "Core/HLE/sceKernelModule.h"
++#include "Core/HLE/sceUmd.h"
+ #include "Core/HLE/Plugins.h"
+ #include "Core/HLE/ReplaceTables.h"
+ #include "Core/HLE/sceKernel.h"
+@@ -601,6 +604,26 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
+ 
+ 	InstallExceptionHandler(&Memory::HandleFault, g_Config.bLogNativeCrashStackTraces);
+ 
++#if PPSSPP_PLATFORM(SWITCH)
++	// Same game, two entry points (PPSSPP menu vs. the XMB's UMD slot) behave very
++	// differently, so dump the settings that decide emulation speed to the SD log.
++	printf("[perf] cpucore=%d fastmem=%d iotiming=%d gpu=%d resol=%d frameskip=%d vsh=%d disc='%s'\n",
++		g_Config.iCpuCore, (int)g_Config.bFastMemory, g_Config.iIOTimingMethod,
++		(int)g_Config.iGPUBackend, g_Config.iInternalResolution,
++		g_Config.iFrameSkip, (int)__KernelIsRunningVSH(), g_paramSFO.GetDiscID().c_str());
++#endif
++
++	// A title started from the XMB's UMD slot can inherit the shell's frame timing
++	// baseline, which made the first seconds of gameplay run at 55-75% speed.
++	__DisplayResetFrameTiming();
++
++	// Same story for the shader cache: the GPU was brought up while the shell was running,
++	// so it never loaded a cache for this title. Point it at the right file now, otherwise
++	// every shader compiles on the fly and frames take 100ms+.
++	if (gpu) {
++		gpu->ReloadShaderCache(g_paramSFO.GetDiscID());
++	}
++
+ 	return true;
+ }
+ 
+@@ -631,6 +654,10 @@ void CPU_Shutdown(bool success) {
+ 	DisplayHWShutdown();
+ 
+ 	pspFileSystem.Shutdown();  // This unmounts all filesystems.
++	// ...which is why the host-side view of the drive has to be cleared here too: nothing in this
++	// path goes through the eject code, and a path left over from this session would tell the next
++	// shell boot that a disc is still inserted while disc0: no longer exists.
++	__UmdClearHostState();
+ 
+ 	// Everything the disassembly cache describes - emulated memory and the symbol map - is about
+ 	// to go away, so drop it here rather than leaving it to whichever debugger UI closes last.
+diff --git a/GPU/GPUCommon.h b/GPU/GPUCommon.h
+index 9372dce..c66dc8c 100644
+--- a/GPU/GPUCommon.h
++++ b/GPU/GPUCommon.h
+@@ -322,6 +322,15 @@ class GPUCommon {
+ 
+ 	virtual void BuildReportingInfo() = 0;
+ 
++public:
++	// Re-point the on-disk shader cache at a game after the backend was already initialized.
++	// Needed on Switch when a title is booted from the XMB's UMD slot: the GPU comes up while
++	// the shell is running, so g_paramSFO has no disc ID yet and no cache is ever loaded,
++	// which makes every shader compile on the fly (200ms+ frames) until the scene settles.
++	virtual void ReloadShaderCache(const std::string &discID) {}
++
++protected:
++
+ 	virtual void UpdateMSAALevel(Draw::DrawContext *draw) {}
+ 
+ 	enum {
+diff --git a/GPU/Vulkan/GPU_Vulkan.cpp b/GPU/Vulkan/GPU_Vulkan.cpp
+index 7f8c960..849561a 100644
+--- a/GPU/Vulkan/GPU_Vulkan.cpp
++++ b/GPU/Vulkan/GPU_Vulkan.cpp
+@@ -101,6 +101,23 @@ void GPU_Vulkan::FinishInitOnMainThread() {
+ 	framebufferManagerVulkan_->Init(msaaLevel_);
+ }
+ 
++void GPU_Vulkan::ReloadShaderCache(const std::string &discID) {
++	if (discID.empty()) {
++		printf("[cache] ReloadShaderCache: discID is empty, no cache to load\n");
++		return;
++	}
++	const Path newPath = GetSysDirectory(DIRECTORY_APP_CACHE) / (discID + ".vkshadercache");
++	if (shaderCachePath_.ToString() == newPath.ToString()) {
++		printf("[cache] already using %s\n", newPath.ToVisualString().c_str());
++		return;  // Already pointed at this game's cache.
++	}
++	const bool exists = File::Exists(newPath);
++	printf("[cache] switching to %s (file %s)\n", newPath.ToVisualString().c_str(), exists ? "exists" : "MISSING");
++	File::CreateFullPath(GetSysDirectory(DIRECTORY_APP_CACHE));
++	shaderCachePath_ = newPath;
++	LoadCache(shaderCachePath_);
++}
++
+ void GPU_Vulkan::LoadCache(const Path &filename) {
+ 	_dbg_assert_(draw_);
+ 	if (!g_Config.bShaderCache) {
+@@ -110,13 +127,21 @@ void GPU_Vulkan::LoadCache(const Path &filename) {
+ 
+ 	// Actually precompiled by IsReady() since we're single-threaded.
+ 	FILE *f = File::OpenCFile(filename, "rb");
+-	if (!f)
++	if (!f) {
++		printf("[cache]   cannot open %s\n", filename.ToVisualString().c_str());
+ 		return;
++	}
++	if (File::Fseek(f, 0, SEEK_END) == 0) {
++		const long size = File::Ftell(f);
++		File::Fseek(f, 0, SEEK_SET);
++		printf("[cache]   file size = %ld bytes\n", size);
++	}
+ 
+ 	// First compile shaders to SPIR-V, then load the pipeline cache and recreate the pipelines.
+ 	// It's when recreating the pipelines that the pipeline cache is useful - in the ideal case,
+ 	// it can just memcpy the finished shader binaries out of the pipeline cache file.
+ 	bool result = ShaderManagerVulkan::LoadCacheFlags(f, &drawEngine_);
++	printf("[cache]   header=%d\n", (int)result);
+ 	if (!result) {
+ 		WARN_LOG(Log::G3D, "ShaderManagerVulkan failed to load cache header.");
+ 	}
+@@ -124,6 +149,7 @@ void GPU_Vulkan::LoadCache(const Path &filename) {
+ 		// Reload use flags in case LoadCacheFlags() changed them.
+ 		gstate_c.SetUseFlags(CheckGPUFeatures());
+ 		result = shaderManagerVulkan_->LoadCache(f);
++		printf("[cache]   shaders=%d\n", (int)result);
+ 		if (!result) {
+ 			WARN_LOG(Log::G3D, "ShaderManagerVulkan failed to load cache.");
+ 		}
+@@ -131,6 +157,7 @@ void GPU_Vulkan::LoadCache(const Path &filename) {
+ 	if (result) {
+ 		// WARNING: See comment in LoadPipelineCache if you are tempted to flip the second parameter to true.
+ 		result = pipelineManager_->LoadPipelineCache(f, false, shaderManagerVulkan_, draw_, drawEngine_.GetPipelineLayout(), msaaLevel_);
++		printf("[cache]   pipelines=%d\n", (int)result);
+ 	}
+ 	fclose(f);
+ 
+@@ -142,13 +169,21 @@ void GPU_Vulkan::LoadCache(const Path &filename) {
+ 	double seconds = time_now_d() - start;
+ 	INFO_LOG(Log::G3D, "Waited %0.1fms for at least %d pipeline tasks to finish compiling.", seconds * 1000.0, maxTasksSeen);
+ 
++	printf("[cache]   waited=%.0fms tasks=%d final=%d\n", seconds * 1000.0, maxTasksSeen, (int)result);
++
+ 	if (!result) {
+ 		WARN_LOG(Log::G3D, "Incompatible Vulkan pipeline cache - rebuilding.");
+ 		// Bad cache file for this GPU/Driver/etc. Delete it.
+ 		File::Delete(filename);
++		printf("[cache]   cache rejected, file deleted\n");
+ 	} else {
+ 		INFO_LOG(Log::G3D, "Loaded Vulkan pipeline cache.");
++		printf("[cache]   cache accepted\n");
+ 	}
++	// How many pipelines the manager actually holds after the load, including any compiled while
++	// waiting above. Printed to tell "cache loaded but container empty" apart from a mismatch in
++	// what the cache contains - only on cache (re)loads, never per frame.
++	printf("[cache]   container pipelines=%d\n", pipelineManager_->GetNumPipelines());
+ }
+ 
+ void GPU_Vulkan::SaveCache(const Path &filename) {
+@@ -171,6 +206,19 @@ void GPU_Vulkan::SaveCache(const Path &filename) {
+ 	pipelineManager_->SavePipelineCache(f, false, shaderManagerVulkan_, draw_);
+ 	INFO_LOG(Log::G3D, "Saved Vulkan pipeline cache");
+ 	fclose(f);
++
++	FILE *chk = File::OpenCFile(filename, "rb");
++	if (chk) {
++		File::Fseek(chk, 0, SEEK_END);
++		printf("[cache] saved %ld bytes -> %s\n", File::Ftell(chk), filename.ToVisualString().c_str());
++		fclose(chk);
++	} else {
++		printf("[cache] saved but cannot verify %s\n", filename.ToVisualString().c_str());
++	}
++	// How many pipelines went into the file - the caller's only way to tell whether a cache that
++	// saves fine actually contains this title's pipelines. SaveCache runs at most a few times per
++	// session, so this stays off the hot path.
++	printf("[cache]   container pipelines=%d\n", pipelineManager_->GetNumPipelines());
+ }
+ 
+ GPU_Vulkan::~GPU_Vulkan() {
+diff --git a/GPU/Vulkan/GPU_Vulkan.h b/GPU/Vulkan/GPU_Vulkan.h
+index 12871e4..381e42a 100644
+--- a/GPU/Vulkan/GPU_Vulkan.h
++++ b/GPU/Vulkan/GPU_Vulkan.h
+@@ -59,6 +59,8 @@ class GPU_Vulkan : public GPUCommonHW {
+ 	TextureCacheVulkan *GetTextureCache() { return textureCacheVulkan_; }
+ 	const PipelineManagerVulkan *GetPipelineManager() const { return pipelineManager_; }
+ 
++	void ReloadShaderCache(const std::string &discID) override;
++
+ protected:
+ 	void FinishDeferred() override;
+ 	void CheckRenderResized(const DisplayLayoutConfig &config) override;
+diff --git a/GPU/Vulkan/PipelineManagerVulkan.cpp b/GPU/Vulkan/PipelineManagerVulkan.cpp
+index a4fc528..1fa1e20 100644
+--- a/GPU/Vulkan/PipelineManagerVulkan.cpp
++++ b/GPU/Vulkan/PipelineManagerVulkan.cpp
+@@ -677,6 +677,7 @@ void PipelineManagerVulkan::SavePipelineCache(FILE *file, bool saveRawPipelineCa
+ 	}
+ 
+ 	NOTICE_LOG(Log::G3D, "Saved Vulkan pipeline ID cache (%d unique pipelines/%d).", (int)keys.size(), (int)pipelines_.size());
++	printf("[cache]   saved keys=%d pipelines=%d\n", (int)keys.size(), (int)pipelines_.size());
+ }
+ 
+ bool PipelineManagerVulkan::LoadPipelineCache(FILE *file, bool loadRawPipelineCache, ShaderManagerVulkan *shaderManager, Draw::DrawContext *drawContext, VKRPipelineLayout *layout, int multiSampleLevel) {
+diff --git a/SDL/SDLMain.cpp b/SDL/SDLMain.cpp
+index 2647a93..0339be5 100644
+--- a/SDL/SDLMain.cpp
++++ b/SDL/SDLMain.cpp
+@@ -1981,6 +1981,33 @@ void UpdateSDLCursor() {
+ int main(int argc, char *argv[]) {
+ 	TimeInit();
+ 
++#if PPSSPP_PLATFORM(SWITCH)
++	// Graphics-backend selection failures are invisible on hardware otherwise, so mirror
++	// stdout/stderr to the SD card root. Overwrites on each launch.
++	// Append across launches so several runs (e.g. launching a game from the PPSSPP
++	// menu vs. from the XMB's UMD slot) can be compared in one file. Reset once it
++	// grows past 512 KB so it never fills the SD card.
++	{
++		const char *logPath = "sdmc:/ppsspp_log.txt";
++		bool append = false;
++		if (FILE *existing = fopen(logPath, "rb")) {
++			fseek(existing, 0, SEEK_END);
++			const long size = ftell(existing);
++			fclose(existing);
++			append = size > 0 && size < 512 * 1024;
++		}
++		if (freopen(logPath, append ? "a" : "w", stdout)) {
++			setvbuf(stdout, nullptr, _IONBF, 0);
++			if (append) {
++				printf("\n===== new launch =====\n");
++			}
++		}
++	}
++	if (freopen("sdmc:/ppsspp_log.txt", "a", stderr)) {
++		setvbuf(stderr, nullptr, _IONBF, 0);
++	}
++#endif
++
+ #if PPSSPP_PLATFORM(SWITCH)
+ 	std::string restartHandoff = SwitchTakeRestartHandoff();
+ #endif
+@@ -2257,6 +2284,7 @@ int main(int argc, char *argv[]) {
+ 	switch ((GPUBackend)g_Config.iGPUBackend) {
+ 	case GPUBackend::VULKAN:
+ 		if (!vulkanMayBeAvailable) {
++			printf("[backend] Vulkan reported unavailable, switching to OpenGL\n");
+ 			fprintf(stderr, "Vulkan is not available, switching to OpenGL.\n");
+ 			g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
+ 		} else {
+@@ -2378,13 +2406,18 @@ int main(int argc, char *argv[]) {
+ 
+ 	GraphicsContext *graphicsContext = nullptr;
+ 	std::string error_message;
++	// printf (stdout) rather than stderr: on Switch only stdout reaches the SD card log.
++	printf("[backend] trying %s\n", GPUBackendToString((GPUBackend)g_Config.iGPUBackend).c_str());
+ 	if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
++		printf("[backend] FAILED %s: %s\n", GPUBackendToString((GPUBackend)g_Config.iGPUBackend).c_str(), error_message.c_str());
+ 		fprintf(stderr, "Failed to initialize graphics backend: %s\n", error_message.c_str());
+ 		if (fallbackGPUBackend != -1) {
++			printf("[backend] falling back to %s\n", GPUBackendToString((GPUBackend)fallbackGPUBackend).c_str());
+ 			fprintf(stderr, "Attempting to fall back to %s...\n", fallbackGPUBackend == (int)GPUBackend::OPENGL ? "OpenGL" : "Vulkan");
+ 			g_Config.iGPUBackend = fallbackGPUBackend;
+ 			error_message.clear();
+ 			if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
++				printf("[backend] FALLBACK FAILED: %s\n", error_message.c_str());
+ 				fprintf(stderr, "Fallback failed: %s\n", error_message.c_str());
+ 				SDL_Quit();
+ 				return 1;
+@@ -2397,6 +2430,7 @@ int main(int argc, char *argv[]) {
+ 	}
+ 
+ 	// At this point, we have a window that we can show finally.
++	printf("[backend] initialized %s\n", GPUBackendToString((GPUBackend)g_Config.iGPUBackend).c_str());
+ 	SDL_ShowWindow(window);
+ 	if (x != SDL_WINDOWPOS_UNDEFINED && y != SDL_WINDOWPOS_UNDEFINED) {
+ 		SDL_SetWindowPosition(window, x, y);
+diff --git a/UI/EmuScreen.cpp b/UI/EmuScreen.cpp
+index 27d6bdd..fc5d341 100644
+--- a/UI/EmuScreen.cpp
++++ b/UI/EmuScreen.cpp
+@@ -628,6 +628,20 @@ void EmuScreen::sendMessage(UIMessage message, const char *value) {
+ 			gamePath_ = newGamePath;
+ 		}
+ 	} else if (message == UIMessage::CONFIG_LOADED) {
++		// A title booted from the shell's UMD slot: the host's notion of "which game" was just
++		// switched from the shell to the disc. Every screen that describes the game - the pause
++		// menu, the game info popup, screenshot viewing - is built from gamePath_, and
++		// GameInfoCache scans that path for the title/ID, so it has to follow or they'd all keep
++		// reporting the shell (vshmain.prx). Assigning the Path is enough: no screen holds a
++		// pointer to it, they only copy it when constructed.
++		//
++		// Only when it really changed: a game booted from PPSSPP's own menu already has the right
++		// path here, and re-assigning on every message would be pointless.
++		const Path &hostGamePath = PSP_CoreParameter().fileToStart;
++		if (!hostGamePath.empty() && hostGamePath.ToString() != gamePath_.ToString()) {
++			gamePath_ = hostGamePath;
++			printf("[boot] emuscreen path -> %s\n", gamePath_.ToVisualString().c_str());
++		}
+ 		// In case we need to position touch controls differently.
+ 		RecreateViews();
+ 	} else if (message == UIMessage::SHOW_CONTROL_MAPPING && screenManager()->topScreen() == this) {
+diff --git a/UI/NativeApp.cpp b/UI/NativeApp.cpp
+index 2e23443..f35178d 100644
+--- a/UI/NativeApp.cpp
++++ b/UI/NativeApp.cpp
+@@ -458,6 +458,21 @@ static void CheckFailedGPUBackends() {
+ 		g_Config.sFailedGPUBackends = data;
+ 	}
+ 
++	// Diagnostics go to stdout: on Switch stderr is not redirected to the SD card log.
++	printf("[backend] configured=%s failed='%s'\n",
++		GPUBackendToString((GPUBackend)lastBackend).c_str(), g_Config.sFailedGPUBackends.c_str());
++
++#if PPSSPP_PLATFORM(SWITCH)
++	// A stale entry here silently forces the old backend forever - the settings UI shows
++	// no error, the choice just does not stick. Let the user's explicit selection win and
++	// start from a clean slate on every launch; a real crash will just be recorded again.
++	if (!g_Config.sFailedGPUBackends.empty()) {
++		printf("[backend] clearing stale failed-backend list on Switch\n");
++		g_Config.sFailedGPUBackends.clear();
++		File::Delete(failedBackendsFile, true);
++	}
++#endif
++
+ 	// Use this if you want to debug a graphics crash...
+ 	if (g_Config.sFailedGPUBackends == "IGNORE")
+ 		return;
+diff --git a/UI/PauseScreen.cpp b/UI/PauseScreen.cpp
+index 1d2d4e5..d639b80 100644
+--- a/UI/PauseScreen.cpp
++++ b/UI/PauseScreen.cpp
+@@ -50,6 +50,7 @@
+ #include "Core/ELF/ParamSFO.h"
+ #include "Core/HLE/sceDisplay.h"
+ #include "Core/HW/Display.h"
++#include "Core/HLE/sceKernelModule.h"
+ #include "Core/HLE/sceUmd.h"
+ #include "Core/HLE/sceNet.h"
+ #include "Core/HLE/sceNetInet.h"
+@@ -698,7 +699,23 @@ void GamePauseScreen::CreateViews() {
+ 	buttonColumn->Add(rightColumnItems);
+ 
+ 	rightColumnItems->SetSpacing(0.0f);
+-	if (getUMDReplacePermit()) {
++	// Only offer Insert/Eject while the shell is actually in the foreground. Ejecting unmounts
++	// disc0:, so offering it during a game that was booted from that very disc would pull the
++	// filesystem out from under the running title. A game started from the XMB still counts as
++	// "VSH running" (see __KernelIsShellForeground), hence the narrower test.
++	if (__KernelIsShellForeground()) {
++		// The XMB notices discs coming and going by itself, like a PSP's.
++		if (__UmdIsInserted()) {
++			rightColumnItems->Add(new Choice(pa->T("Eject UMD"), ImageID("I_UMD")))->OnClick.Add([this](UI::EventParams &) {
++				__UmdEject();
++				RecreateViews();
++			});
++		} else {
++			rightColumnItems->Add(new Choice(pa->T("Insert UMD"), ImageID("I_UMD")))->OnClick.Add([this](UI::EventParams &) {
++				screenManager()->push(new UmdReplaceScreen());
++			});
++		}
++	} else if (getUMDReplacePermit()) {
+ 		rightColumnItems->Add(new Choice(pa->T("Switch UMD"), ImageID("I_UMD")))->OnClick.Add([this](UI::EventParams &) {
+ 			screenManager()->push(new UmdReplaceScreen());
+ 		});
+diff --git a/assets/lang/en_US.ini b/assets/lang/en_US.ini
+index da16615..2c13d92 100644
+--- a/assets/lang/en_US.ini
++++ b/assets/lang/en_US.ini
+@@ -1072,8 +1072,10 @@ Cheats = Cheats
+ Continue = Continue
+ Create Game Config = Create game config
+ Delete Game Config = Delete game config
++Eject UMD = Eject UMD
+ Exit to menu = Exit to menu
+ Game Settings = Game settings
++Insert UMD = Insert UMD
+ Load State = Load state
+ Rewind = Rewind
+ Save State = Save state
+diff --git a/assets/lang/zh_CN.ini b/assets/lang/zh_CN.ini
+index 801ac77..980fec5 100644
+--- a/assets/lang/zh_CN.ini
++++ b/assets/lang/zh_CN.ini
+@@ -1098,8 +1098,10 @@ Cheats = 金手指
+ Continue = 继续游戏
+ Create Game Config = 建立游戏预设配置
+ Delete Game Config = 删除游戏预设配置
++Eject UMD = Eject UMD
+ Exit to menu = 返回主菜单
+ Game Settings = 游戏设置
++Insert UMD = Insert UMD
+ Load State = 载入即时存档
+ Rewind = 倒带
+ Save State = 保存即时存档

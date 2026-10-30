@@ -1,0 +1,262 @@
+#include <algorithm>
+
+#include "Common/Log.h"
+#include "Common/System/Display.h"
+#include "Common/System/System.h"
+#include "Common/System/Request.h"
+#include "Common/Input/InputState.h"
+#include "Common/Input/KeyCodes.h"
+#include "Common/UI/UIScreen.h"
+#include "Common/UI/Context.h"
+#include "Common/UI/ScreenManager.h"
+#include "Common/UI/Root.h"
+#include "Common/Render/DrawBuffer.h"
+
+static constexpr bool ClickDebug = false;
+
+UIScreen::UIScreen() : Screen() {
+	lastOrientation_ = GetDeviceOrientation();
+}
+
+UIScreen::~UIScreen() {
+	delete root_;
+}
+
+// This is the source of truth for orientation for configuration and rendering.
+DeviceOrientation UIScreen::GetDeviceOrientation() const {
+	// TODO: On some platforms, we can do a more sophisticated check.
+	return g_display.GetDeviceOrientation();
+}
+
+void UIScreen::DoRecreateViews() {
+	if (!recreateViews_) {
+		return;
+	}
+
+	UI::PersistMap persisted;
+	bool persisting = root_ != nullptr;
+	if (persisting) {
+		root_->PersistData(UI::PERSIST_SAVE, "root", persisted);
+	}
+
+	// Pending requests from the views (like an open text input dialog) would call back into deleted views.
+	ForgetViewRequests();
+
+	delete root_;
+	root_ = nullptr;
+	SetCreatingViews(true);
+	lastLayoutMode_ = LayoutMode();
+	CreateViews();
+	UI::View *defaultView = root_ ? root_->GetDefaultFocusView() : nullptr;
+	if (defaultView && defaultView->GetVisibility() == UI::V_VISIBLE) {
+		defaultView->SetFocus(UI::FocusFlags::CAUSE_OTHER);
+	}
+	recreateViews_ = false;
+
+	if (persisting && root_ != nullptr) {
+		// Still creating views: restoring a TabHolder's current tab can create the tab.
+		root_->PersistData(UI::PERSIST_RESTORE, "root", persisted);
+
+		// Update layout and refocus so things scroll into view.
+		// This is for resizing down, when focused on something now offscreen.
+		UI::LayoutViewHierarchy(*screenManager()->getUIContext(), GetContentBounds(*screenManager()->getUIContext()), root_);
+		UI::View *focused = UI::GetFocusedView();
+		if (focused) {
+			root_->SubviewFocused(focused);
+		}
+	}
+	SetCreatingViews(false);
+}
+
+bool UIScreen::touch(const TouchInput &touch) {
+	if (ClickDebug && root_ && (touch.flags & TouchInputFlags::DOWN)) {
+		INFO_LOG(Log::System, "Touch down!");
+		std::vector<UI::View *> views;
+		root_->Query(touch.x, touch.y, views);
+		for (auto view : views) {
+			INFO_LOG(Log::System, "%s", view->DescribeLog().c_str());
+		}
+	}
+
+	if (!ignoreInput_ && root_) {
+		UI::TouchEvent(touch, root_);
+	}
+	return true;
+}
+
+void UIScreen::axis(const AxisInput &axis) {
+	if (!ignoreInput_ && root_) {
+		UI::AxisEvent(axis, root_);
+	}
+}
+
+bool UIScreen::key(const KeyInput &key) {
+	if (!ignoreInput_ && root_) {
+		return UI::KeyEvent(key, root_);
+	} else {
+		return false;
+	}
+}
+
+void UIScreen::update() {
+	DeviceOrientation orientation = GetDeviceOrientation();
+	if (orientation != lastOrientation_) {
+		RecreateViews();
+		lastOrientation_ = orientation;
+	}
+	// Views can be laid out for the bounds they were created in (like the touch controls).
+	if (LayoutMode() != lastLayoutMode_) {
+		RecreateViews();
+	}
+
+	DoRecreateViews();
+
+	if (root_) {
+		DialogResult result = UpdateViewHierarchy(root_, AllowFocusMovement());
+		if (result != DR_NONE) {
+			TriggerFinish(result);
+		}
+	}
+}
+
+void UIScreen::deviceLost() {
+	if (root_)
+		root_->DeviceLost();
+}
+
+void UIScreen::deviceRestored(Draw::DrawContext *draw) {
+	if (root_)
+		root_->DeviceRestored(draw);
+}
+
+Bounds UIScreen::GetLayoutBounds(UIContext &dc) const {
+	return dc.GetLayoutBounds(LayoutMode(), UseImmersiveMode());
+}
+
+// On TVs and big monitors, controls out at the edges are hard to see and far apart. Grows with the
+// screen, from nothing at 600 high (or wide, if smaller) to the full inset at 1000, so resizing a window
+// doesn't make it jump. Phones and tablets are held close, and have their own system insets.
+static float LargeScreenInset() {
+	const float fullInset = 40.0f;
+	const int deviceType = System_GetPropertyInt(SYSPROP_DEVICE_TYPE);
+	if (deviceType == DEVICE_TYPE_TV) {
+		return fullInset;
+	}
+	if (deviceType == DEVICE_TYPE_MOBILE) {
+		return 0.0f;
+	}
+	const float size = (float)std::min(g_display.dp_xres, g_display.dp_yres);
+	return fullInset * std::clamp((size - 600.0f) / 400.0f, 0.0f, 1.0f);
+}
+
+Bounds UIScreen::GetContentBounds(const UIContext &dc) const {
+	const UI::Margins margins = RootMargins();
+	Bounds bounds = dc.GetLayoutBounds(LayoutMode(), UseImmersiveMode());
+	bounds.x += margins.left;
+	bounds.y += margins.top;
+	bounds.w -= margins.horiz();
+	bounds.h -= margins.vert();
+	if (!LimitContentArea()) {
+		return bounds;
+	}
+
+	const float inset = LargeScreenInset();
+	bounds.x += inset;
+	bounds.y += inset;
+	bounds.w -= inset * 2.0f;
+	bounds.h -= inset * 2.0f;
+	const float maxWidth = MaxContentWidth();
+	if (maxWidth > 0.0f && bounds.w > maxWidth) {
+		bounds.x += (bounds.w - maxWidth) * 0.5f;
+		bounds.w = maxWidth;
+	}
+	return bounds;
+}
+
+ScreenRenderFlags UIScreen::render(ScreenRenderMode mode) {
+	// A screen rendered under a popup must keep its views: the popup's callbacks point into them (the choice
+	// that opened it, the value it writes to). update() recreates them once the screen is on top again.
+	if (!root_ || !screenManager()->HasScreenAbove(this)) {
+		DoRecreateViews();
+	}
+
+	UIContext &uiContext = *screenManager()->getUIContext();
+	if (root_) {
+		UI::LayoutViewHierarchy(uiContext, GetContentBounds(uiContext), root_);
+	}
+
+	uiContext.PushTransform({translation_, scale_, alpha_});
+
+	uiContext.Begin();
+	DrawBackground(uiContext);
+	if (root_) {
+		root_->Draw(uiContext);
+	}
+	uiContext.Flush();
+	DrawForeground(uiContext);
+	uiContext.Flush();
+
+	uiContext.PopTransform();
+
+	return ScreenRenderFlags::NONE;
+}
+
+TouchInput UIScreen::transformTouch(const TouchInput &touch) {
+	TouchInput updated = touch;
+
+	float x = touch.x - translation_.x;
+	float y = touch.y - translation_.y;
+	// Scale around the center as the origin.
+	updated.x = (x - g_display.dp_xres * 0.5f) / scale_.x + g_display.dp_xres * 0.5f;
+	updated.y = (y - g_display.dp_yres * 0.5f) / scale_.y + g_display.dp_yres * 0.5f;
+
+	return updated;
+}
+
+void UIScreen::TriggerFinish(DialogResult result) {
+	// From here on, this dialog cannot receive input.
+	ignoreInput_ = true;
+	screenManager()->finishDialog(this, result);
+}
+
+bool UIDialogScreen::key(const KeyInput &key) {
+	bool retval = UIScreen::key(key);
+	if (!retval && (key.flags & KeyInputFlags::DOWN) && UI::IsEscapeKey(key)) {
+		if (finished_) {
+			ERROR_LOG(Log::System, "Screen already finished");
+		} else if (!firstFrame_) {
+			finished_ = true;
+			TriggerFinish(DR_BACK);
+			UI::PlayUISound(UI::UISound::BACK);
+		}
+		return true;
+	}
+	return retval;
+}
+
+void UIDialogScreen::sendMessage(UIMessage message, const char *value) {
+	Screen *screen = screenManager()->dialogParent(this);
+	if (screen) {
+		screen->sendMessage(message, value);
+	}
+}
+
+UIDialogScreen::~UIDialogScreen() {
+	System_NotifyUIEvent(UIEventNotification::DIALOG_CLOSED);
+}
+
+bool UIScreen::IsOnTop() const {
+	return screenManager()->topScreen() == this;
+}
+
+void UIScreen::OnBack(UI::EventParams &e) {
+	TriggerFinish(DR_BACK);
+}
+
+void UIScreen::OnOK(UI::EventParams &e) {
+	TriggerFinish(DR_OK);
+}
+
+void UIScreen::OnCancel(UI::EventParams &e) {
+	TriggerFinish(DR_CANCEL);
+}

@@ -1,0 +1,179 @@
+set(ARMIPS_REGEXP OFF CACHE BOOL "" FORCE)
+set(ARMIPS_LIBRARY_ONLY ON CACHE BOOL "" FORCE)
+if(WIN32 OR USE_LIBNX)
+	set(ARMIPS_USE_STD_FILESYSTEM ON CACHE BOOL "" FORCE)
+endif()
+
+add_subdirectory(armips)
+
+if(NOT USING_GLES2 AND NOT NO_OPENGL)
+	add_subdirectory(glew)
+endif()
+
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "let's not build binaries we don't need" FORCE)
+set(SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS ON CACHE BOOL "let's not use exceptions" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "we don't need spvremapper" FORCE)
+
+# not really needed since we currently bypass the official cmakelists...
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "we don't need zlib examples" FORCE)
+
+# We only feed glslang GLSL, so its HLSL frontend is dead weight (and once hit an NDK 20 compiler
+# issue, PPSSPP issue #12105). Windows keeps it, to match the MSVC and UWP projects.
+if(NOT WIN32)
+	set(ENABLE_HLSL OFF CACHE BOOL "let's not build HLSL support we don't need" FORCE)
+endif()
+
+# This works around a bug in cpu_features when ${CMAKE_BINARY_DIR} != ${CMAKE_CURRENT_BINRARY_DIR}.
+# We also disable the list_cpu_features binary.
+add_subdirectory(cmake/cpu_features EXCLUDE_FROM_ALL)
+
+set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_INSTALL OFF)
+if(USE_LIBNX)
+	set(PPSSPP_SAVED_UNIX "${UNIX}")
+	set(UNIX ON)
+endif()
+add_subdirectory(glslang EXCLUDE_FROM_ALL)
+if(USE_LIBNX)
+	set(UNIX "${PPSSPP_SAVED_UNIX}")
+	unset(PPSSPP_SAVED_UNIX)
+endif()
+add_subdirectory(snappy)
+add_subdirectory(lua-build)
+add_subdirectory(at3_standalone)
+add_subdirectory(udis86)
+add_subdirectory(SPIRV-Cross-build)
+add_subdirectory(rcheevos-build)
+add_subdirectory(gason)
+add_subdirectory(vma)
+add_subdirectory(cityhash)
+add_subdirectory(lzma-sdk)
+add_subdirectory(basis_universal)
+add_subdirectory(pugixml)
+add_subdirectory(libkirk)
+add_subdirectory(sfmt19937)
+add_subdirectory(xbrz)
+
+add_library(xxhash STATIC
+	xxhash.c
+	xxhash.h
+)
+
+# Only the deflate encoder, for writing CSO files (Core/FileSystems/CSOCompress.cpp).
+add_library(libdeflate STATIC
+	libdeflate/lib/deflate_compress.c
+	libdeflate/lib/utils.c
+)
+
+set(aemu_postoffice_client_obj
+	aemu_postoffice/client/postoffice.c
+	aemu_postoffice/client/postoffice_mem_stdc.c
+	aemu_postoffice/client/mutex_impl_cpp.cpp
+	aemu_postoffice/client/delay_impl_cpp.cpp
+	aemu_postoffice/client/log_impl_ppsspp.cpp
+	aemu_postoffice/client/list.c
+	aemu_postoffice/client/enet.c
+	aemu_postoffice/adhocctl/client/adhocctl.c
+	aemu_postoffice/adhocctl/client/adhocctl_mem.c
+)
+
+if(WIN32)
+	list(APPEND aemu_postoffice_client_obj
+		aemu_postoffice/client/sock_impl_windows.c
+	)
+endif()
+
+if(LINUX OR ANDROID OR MACOSX OR IOS OR BSD OR USE_LIBNX)
+	list(APPEND aemu_postoffice_client_obj
+		aemu_postoffice/client/sock_impl_linux.c
+	)
+endif()
+
+add_library(aemu_postoffice_client STATIC
+	${aemu_postoffice_client_obj}
+)
+
+if(USE_LIBNX)
+	target_compile_definitions(aemu_postoffice_client PRIVATE __unix)
+	# Note: the client stays dual-stack (client/enet.c's connect_enet() writes enet_addr.host.s6_addr,
+	# which only exists in that mode), while the server is switched to IPv4-only below. They use enet
+	# independently and never hand each other an ENetAddress, so the modes don't have to agree.
+endif()
+
+set(aemu_postoffice_server_obj
+	aemu_postoffice/server_cpp/server.cpp
+	aemu_postoffice/server_cpp/session.cpp
+	aemu_postoffice/server_cpp/semaphore.cpp
+	aemu_postoffice/server_cpp/log.cpp
+	aemu_postoffice/server_cpp/common.cpp
+	aemu_postoffice/server_cpp/enet.cpp
+	aemu_postoffice/server_cpp/snapshot.cpp
+)
+
+if(WIN32)
+	list(APPEND aemu_postoffice_server_obj
+		aemu_postoffice/server_cpp/native_socket_windows.cpp
+	)
+endif()
+
+if(LINUX OR ANDROID OR MACOSX OR IOS OR BSD OR USE_LIBNX)
+	list(APPEND aemu_postoffice_server_obj
+		aemu_postoffice/server_cpp/native_socket_linux.cpp
+	)
+endif()
+
+add_library(aemu_postoffice_server STATIC
+	${aemu_postoffice_server_obj}
+)
+
+# server_cpp/semaphore.cpp is written against std::counting_semaphore, which is C++20, while the
+# rest of PPSSPP builds as C++17. devkitA64's libstdc++ does have <semaphore> (GCC 16), it just
+# needs the standard raised for this one target - same thing the Switch frame-generation backend
+# does in the main CMakeLists.
+set_target_properties(aemu_postoffice_server PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+
+if(USE_LIBNX)
+	# newlib needs to be told it's a unix-ish target for the socket headers the server's
+	# native_socket_linux.cpp pulls in. Has to come after add_library: CMake rejects
+	# target_compile_definitions for a target that doesn't exist yet.
+	target_compile_definitions(aemu_postoffice_server PRIVATE __unix)
+	# libnx's struct in6_addr opens its union with uint16_t[8], so enet's dual-stack address
+	# constants - which brace-initialize 16 single bytes - don't fit it. IPv4-only is a mode enet
+	# supports and is all the relay server needs; it also drops the IPv6 paths that want headers
+	# newlib doesn't ship. See the note at the client above on why only this one is switched.
+	target_compile_definitions(aemu_postoffice_server PRIVATE ENET_IPV4_ONLY=1)
+endif()
+
+set(FT_REQUIRE_ZLIB OFF CACHE BOOL "" FORCE)
+set(FT_REQUIRE_BZIP2 OFF CACHE BOOL "" FORCE)
+set(FT_REQUIRE_PNG OFF CACHE BOOL "" FORCE)
+set(FT_REQUIRE_HARFBUZZ OFF CACHE BOOL "" FORCE)
+set(FT_REQUIRE_BROTLI OFF CACHE BOOL "" FORCE)
+# Only AtlasTool uses FreeType.
+if(ATLAS_TOOL AND NOT USE_SYSTEM_FREETYPE)
+    add_subdirectory(freetype freetype-build)
+endif()
+
+if(NOT LIBRETRO)
+    add_subdirectory(imgui)
+endif()
+if(NOT HTTPS_NOT_AVAILABLE AND NOT USE_LIBNX)
+	add_subdirectory(naett-build)
+endif()
+if(USE_DISCORD AND NOT IOS AND NOT LIBRETRO)
+	add_subdirectory(discord-rpc-build)
+endif()
+
+if(NOT USE_SYSTEM_LIBCHDR)
+	add_subdirectory(libchdr-build)
+endif()
+
+if(BUILD_BUNDLED_FFMPEG)
+	add_subdirectory(ffmpeg-build)
+endif()
+
+if(ANDROID)
+    if (ARM64)
+        add_subdirectory(libadrenotools)
+    endif()
+endif()
