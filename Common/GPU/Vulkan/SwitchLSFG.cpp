@@ -1,6 +1,7 @@
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
 
 #include "Common/GPU/Vulkan/VulkanLoader.h"
+#include "Common/SwitchAppRoot.h"
 #include "Common/GPU/Vulkan/lsfg/lsfg_bridge.h"
 
 #include <algorithm>
@@ -15,7 +16,10 @@
 
 namespace
 {
-constexpr const char* kShaderDllPath = "/switch/ppsspp-nx/lsfg/Lossless.dll";
+// Lives next to the NRO's data root (see SwitchAppRoot), not a fixed directory.
+static std::string ShaderDllPath() {
+	return SwitchAppRoot() + "lsfg/Lossless.dll";
+}
 
 std::atomic_bool s_prepared{false};
 std::atomic_bool s_installed{false};
@@ -150,7 +154,7 @@ bool TryCreateRuntime(VkQueue queue)
 		.extent = s_extent,
 		.swapchain_images = s_swapchainImages.data(),
 		.swapchain_image_count = static_cast<uint32_t>(s_swapchainImages.size()),
-		.shader_dll_path = kShaderDllPath,
+		.shader_dll_path = ShaderDllPath().c_str(),
 		.flow_scale = s_flowScale,
 		.performance_mode = s_performanceMode,
 	};
@@ -163,7 +167,7 @@ void SwitchLSFG_Configure(bool prepared, float flowScale, bool performanceMode)
 {
 	s_flowScale = std::isfinite(flowScale) && flowScale == 0.5f ? 0.5f : 0.25f;
 	s_performanceMode = performanceMode;
-	const bool installed = FileReadable(kShaderDllPath);
+	const bool installed = FileReadable(ShaderDllPath().c_str());
 	s_installed.store(installed, std::memory_order_release);
 	prepared = prepared && installed && EnableNvkNoCbuf();
 	s_prepared.store(prepared, std::memory_order_release);

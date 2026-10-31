@@ -396,6 +396,13 @@ public:
 	int iSaveStateSlotCount;
 	bool bEnableCheats;
 	bool bReloadCheats;
+	// Switch: mirrors stdout/stderr to sdmc:/ppsspp_log.txt. Off by default so a release build does
+	// not litter the SD card; read very early in main() before the config file is loaded, so the
+	// value is also parsed by hand there.
+	bool bEnableLogFile = false;
+	// Switch: one-time migration flag, see the backend fixup in NativeApp.cpp. Setting it means
+	// "we already restored the default backend once", so a user who picks OpenGL afterwards keeps it.
+	bool bBackendMigratedToVulkan = false;
 	bool bEnablePlugins;
 	bool bEnableFileHandlerPlugins;
 	int iCwCheatRefreshIntervalMs;

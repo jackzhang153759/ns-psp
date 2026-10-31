@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "Common/File/DirListing.h"
+#include "Common/SwitchAppRoot.h"
 #include "Common/File/FileUtil.h"
 #include "Common/StringUtils.h"
 #include "Common/Thread/ThreadUtil.h"
@@ -18,8 +19,14 @@
 namespace SwitchLibrary {
 namespace {
 
-constexpr const char *kConfigPath = "/switch/ppsspp-nx/library.ini";
-constexpr const char *kDefaultGamesPath = "/switch/ppsspp-nx/games";
+// Both follow the app's data root (next to the NRO, see SwitchAppRoot) instead of a fixed
+// /switch/ppsspp-nx/ - the library has to keep working wherever the user puts the NRO.
+static std::string LibraryConfigPath() {
+	return SwitchAppRoot() + "library.ini";
+}
+static std::string DefaultGamesPath() {
+	return SwitchAppRoot() + "games";
+}
 
 std::mutex s_mutex;
 std::condition_variable s_condition;
@@ -46,7 +53,7 @@ std::string Trim(std::string value) {
 
 std::map<std::string, std::string> ReadConfig() {
 	std::map<std::string, std::string> values;
-	FILE *file = std::fopen(kConfigPath, "rb");
+	FILE *file = std::fopen(LibraryConfigPath().c_str(), "rb");
 	if (!file)
 		return values;
 	char line[4096];
@@ -74,9 +81,9 @@ std::string CleanValue(std::string value) {
 }
 
 void SaveConfigLocked() {
-	File::CreateFullPath(Path("/switch/ppsspp-nx"));
-	const Path temporary(std::string(kConfigPath) + ".tmp");
-	const Path backup(std::string(kConfigPath) + ".old");
+	File::CreateFullPath(Path(LibraryConfigPath()));
+	const Path temporary(LibraryConfigPath() + ".tmp");
+	const Path backup(LibraryConfigPath() + ".old");
 	FILE *file = File::OpenCFile(temporary, "wb");
 	if (!file)
 		return;
@@ -98,7 +105,7 @@ void SaveConfigLocked() {
 			i, CleanValue(share.password).c_str(), i, CleanValue(share.domain).c_str(), i, share.autoMount ? 1 : 0);
 	}
 	std::fclose(file);
-	const Path current(kConfigPath);
+	const Path current(LibraryConfigPath());
 	File::Delete(backup, true);
 	const bool hadCurrent = File::Exists(current);
 	if (hadCurrent && !File::Rename(current, backup)) {
@@ -285,8 +292,8 @@ void Initialize() {
 				s_smbShares.push_back(std::move(share));
 		}
 		if (s_sources.empty()) {
-			File::CreateFullPath(Path(kDefaultGamesPath));
-			s_sources.push_back({SourceType::Local, {}, kDefaultGamesPath});
+			File::CreateFullPath(Path(DefaultGamesPath()));
+			s_sources.push_back({SourceType::Local, {}, DefaultGamesPath()});
 			SaveConfigLocked();
 		}
 		s_stop = false;

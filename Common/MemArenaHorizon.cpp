@@ -85,6 +85,19 @@ void *MemArena::CreateView(s64 offset, size_t size, void *base) {
 	if (offset < 0 || (size_t)offset > PSP_BACKING_STORE_SIZE || size > PSP_BACKING_STORE_SIZE - (size_t)offset) {
 		return nullptr;
 	}
+	// 诊断：视图的目标地址必须落在本 arena 保留的 [memoryBase, memoryBase+SIZE) 内，
+	// 否则 svcMapProcessMemory 必然被内核拒绝（0xDC01/0xD401）。出现这条说明
+	// PPSSPP 侧的 base 与本轮保留区不一致（MemMap 的自动重试会兜底）。
+	// 4GB 布局的镜像视图（kernel/uncached mirror）本来就落在保留区之外，而且内核是接受的
+	// （映射成功的先例见 2026-10-31 战神启动日志）。这条只提示一次，避免每次启动刷 15 行。
+	static bool warnedOutsideOnce = false;
+	if (memoryBase && ((uintptr_t)base < memoryBase || (uintptr_t)base + size > memoryBase + PSP_ADDRESS_SPACE_SIZE)) {
+		if (!warnedOutsideOnce) {
+			printf("[mem] view outside arena reservation (expected for 4GB mirrors, mapping anyway): base=%p size=0x%zx\n",
+				(void *)base, size);
+			warnedOutsideOnce = true;
+		}
+	}
 	Result rc = svcMapProcessMemory(base, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
 	if (R_FAILED(rc)) {
 		printf("Fatal error creating the view... base: %p offset: %p size: %p src: %p err: %d "

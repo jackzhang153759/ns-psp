@@ -396,6 +396,9 @@ static constexpr ConfigSetting generalSettings[] = {
 		.Label(I18NCat::SYSTEM, "Auto load savestate").Choices(autoLoadSaveStateNames),
 	ConfigSetting("EnableCheats", SETTING(g_Config, bEnableCheats), false, CfgFlag::PER_GAME | CfgFlag::REPORT)
 		.Label(I18NCat::SYSTEM, "Enable Cheats"),
+	ConfigSetting("LogFile", SETTING(g_Config, bEnableLogFile), false, CfgFlag::DEFAULT)
+		.Label(I18NCat::SYSTEM, "Generate log file"),
+	ConfigSetting("BackendMigratedToVulkan", SETTING(g_Config, bBackendMigratedToVulkan), false, CfgFlag::DEFAULT),
 	ConfigSetting("EnablePlugins", SETTING(g_Config, bEnablePlugins), true, CfgFlag::PER_GAME | CfgFlag::REPORT)
 		.Label(I18NCat::SYSTEM, "Enable plugins"),
 	ConfigSetting("EnableFileHandlerPlugins", SETTING(g_Config, bEnableFileHandlerPlugins), false, CfgFlag::DEFAULT)

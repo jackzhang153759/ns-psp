@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "Common/Data/Text/I18n.h"
+#include "Core/Config.h"
 #include "Common/System/System.h"
 #include "Common/UI/ScreenManager.h"
 #include "Common/UI/View.h"
@@ -57,4 +58,12 @@ void BuildToolsSettings(SettingsPage *page) {
 	page->Choice({ I18NCat::SYSTEM, "PSP Firmware" }).OpensScreen().OnClick([host](UI::EventParams &) {
 		host->PageScreenManager()->push(new FirmwareScreen(host->PageGamePath()));
 	});
+
+#if PPSSPP_PLATFORM(SWITCH)
+	// No log file is written unless this is on, so a shared build leaves the SD card alone.
+	// Takes effect on the next start: main() reads the setting before the config is loaded.
+	page->Header({ I18NCat::SYSTEM, "Logging" });
+	page->Setting(&g_Config.bEnableLogFile);
+	page->Hint(SettingText(I18NCat::SYSTEM, "Takes effect on the next start. Turn it on, restart, reproduce the problem, then send the ppsspp_log.txt from the SD card root to the author.\n\n下次启动生效：打开后重启程序，复现问题，然后把 SD 卡根目录的 ppsspp_log.txt 发给作者。"));
+#endif
 }

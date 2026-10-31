@@ -54,6 +54,7 @@
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/sceKernelMemory.h"
 #include "Core/HLE/sceNetAdhoc.h"
+#include "Core/HLE/AdhocTransport.h"
 #include "Core/Instance.h"
 #include "proAdhoc.h"
 
@@ -85,6 +86,9 @@ SceNetAdhocctlPeerInfo * friends      = NULL;
 SceNetAdhocctlScanInfo * networks     = NULL;
 SceNetAdhocctlScanInfo * newnetworks  = NULL;
 u64 adhocctlStartTime                 = 0;
+u64 gameModeEnterTimeUs = 0;
+bool groupJoinInFlight = false;
+int abandonedGroupJoins = 0;
 std::atomic<bool> isAdhocctlNeedLogin              = false;
 bool isAdhocctlBusy                   = false;
 int adhocctlState                     = ADHOCCTL_STATE_DISCONNECTED;
@@ -94,7 +98,6 @@ int adhocConnectionType               = ADHOC_CONNECT;
 int gameModeSocket                    = (int)INVALID_SOCKET; // UDP/PDP socket? on Master only?
 int gameModeBuffSize                  = 0;
 u8* gameModeBuffer                    = nullptr;
-extern bool serverHasRelay;
 GameModeArea masterGameModeArea;
 std::vector<GameModeArea> replicaGameModeAreas;
 std::vector<SceNetEtherAddr> requiredGameModeMacs;
@@ -443,39 +446,7 @@ void deleteAllAdhocSockets() {
 		if (adhocSockets[i] != NULL) {
 			auto sock = adhocSockets[i];
 
-			if (serverHasRelay) {
-				if (sock->type == SOCK_PTP) {
-					// sync
-					if (sock->connectThread != NULL) {
-						sock->connectThread->join();
-						delete sock->connectThread;
-					}
-					void *socket = sock->postofficeHandle;
-					if (socket != NULL) {
-						if (sock->data.ptp.state == ADHOC_PTP_STATE_LISTEN) {
-							ptp_listen_close(socket);
-						} else {
-							ptp_close(socket);
-						}
-					}
-				} else {
-					if (sock->postofficeHandle != NULL) {
-						pdp_delete(sock->postofficeHandle);
-					}
-				}
-			} else {
-				int fd = -1;
-				if (sock->type == SOCK_PTP)
-					fd = sock->data.ptp.id;
-				else if (sock->type == SOCK_PDP)
-					fd = sock->data.pdp.id;
-
-				if (fd > 0) {
-					// Close Socket
-					shutdown(fd, SD_RECEIVE);
-					closesocket(fd);
-				}
-			}
+			Transport().CloseHostSocket(sock);
 			// Free Memory
 			free(adhocSockets[i]);
 
@@ -1374,6 +1345,9 @@ void killAdhocctlClient(bool due_to_error, const std::lock_guard<std::mutex> &lo
 
 	destroy_adhocctl_session(adhocctlHandle);
 	adhocctlHandle = NULL;
+	// Nothing more comes from that session.
+	groupJoinInFlight = false;
+	abandonedGroupJoins = 0;
 
 	// Mark all friends as timedout since we won't be able to detects disconnected friends anymore without being connected to Adhoc Server
 	peerlock.lock();
@@ -1514,7 +1488,7 @@ static void StartAdhocctlLogin() {
 	// If Server is at localhost and we are in P2P mode, try to bind socket to specific adapter before connecting to prevent 2nd instance being recognized as already existing 127.0.0.1 by adhocctl server
 	// (may not works in WinXP/2003 for IPv4 due to "Weak End System" model)
 	struct adhocctl_addr_v4 bindAddr = {0};
-	const bool bind = isLocalServer && !serverHasRelay;
+	const bool bind = isLocalServer && Transport().BindServerConnectionToLocalIp();
 	if (bind) {
 		bindAddr.ip = g_localhostIP.in.sin_addr.s_addr;
 		bindAddr.port = 0;
@@ -1640,7 +1614,7 @@ void friendFinderPoll() {
 	uint64_t now = time_now_d() * 1000000.0; // Use time_now_d()*1000000.0 instead of CoreTiming::GetGlobalTimeUsScaled() if the game gets disconnected from AdhocServer too soon when FPS wasn't stable
 
 	// Calculate EnterGameMode Timeout to prevent waiting forever for disconnected players
-	if (isAdhocctlBusy && adhocctlState == ADHOCCTL_STATE_DISCONNECTED && adhocctlCurrentMode == ADHOCCTL_MODE_GAMEMODE && netAdhocGameModeEntered && static_cast<s64>(now - adhocctlStartTime) > netAdhocEnterGameModeTimeout) {
+	if (isAdhocctlBusy && adhocctlState == ADHOCCTL_STATE_DISCONNECTED && adhocctlCurrentMode == ADHOCCTL_MODE_GAMEMODE && netAdhocGameModeEntered && static_cast<s64>(CoreTiming::GetGlobalTimeUs() - gameModeEnterTimeUs) > netAdhocEnterGameModeTimeout) {
 		netAdhocGameModeEntered = false;
 		// A joiner's GAMEMODE is queued as soon as the server answers, and held until the host shows up.
 		// It must not come after all (pspautotests net/adhoc/gamemode).
@@ -1694,6 +1668,12 @@ void friendFinderPoll() {
 			break;
 		case ADHOCCTL_CLIENT_EVENT_LEADER_MAC:{
 			INFO_LOG(Log::sceNet, "FriendFinder: Incoming OPCODE_CONNECT_BSSID [%s]", mac2str((SceNetEtherAddr *)adhocctl_event.leader_mac.mac).c_str());
+			if (abandonedGroupJoins > 0) {
+				abandonedGroupJoins--;
+				INFO_LOG(Log::sceNet, "FriendFinder: Ignoring the BSSID of an abandoned group join");
+				break;
+			}
+			groupJoinInFlight = false;
 			// Update Group BSSID
 			memcpy(parameter.bssid.mac_addr.data, adhocctl_event.leader_mac.mac, 6); // This packet seems to contains Adhoc Group Creator's BSSID (similar to AP's BSSID) so it shouldn't get mixed up with local MAC address. Note: On JPCSP + prx files params.bssid is hardcoded to "Jpcsp\0" and doesn't match to any of player's mac
 
@@ -1753,6 +1733,11 @@ void friendFinderPoll() {
 		case ADHOCCTL_CLIENT_EVENT_CONNECT:{
 			u32_le ipaddr = adhocctl_event.connect.id;
 			INFO_LOG(Log::sceNet, "FriendFinder: Incoming OPCODE_CONNECT [%s][%s][%s]", mac2str((SceNetEtherAddr *)adhocctl_event.connect.mac).c_str(), ip2str(*(in_addr*)&ipaddr).c_str(), adhocctl_event.connect.nickname);
+			// A player of an abandoned join's group, or of one we've left (the server didn't know yet).
+			if (abandonedGroupJoins > 0 || !NetAdhocctl_InServerGroup()) {
+				INFO_LOG(Log::sceNet, "FriendFinder: Ignoring a player of a group we're not joining");
+				break;
+			}
 
 			// Add User
 			addFriend(adhocctl_event.connect);

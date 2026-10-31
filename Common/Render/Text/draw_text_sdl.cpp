@@ -291,6 +291,35 @@ void TextDrawerSDL::PrepareFallbackFonts(std::string_view locale) {
 			}
 		}
 	}
+#elif PPSSPP_PLATFORM(SWITCH)
+	// Assets are packed into the NRO's romfs and mounted at ASSETS_DIR, so the fallback font is a
+	// plain file path next to the atlas assets. Without a CJK fallback every Chinese character
+	// drawn by SDL3_ttf has no glyph, and the atlas path has no CJK range at all - that is where
+	// the '?' in the UI came from.
+	static const char *const switchFallbackFonts[] = {
+		"fonts/NotoSansSC-Regular.otf",
+		"fonts/NotoSansSC-Regular.ttf",
+	};
+	for (const char *relativePath : switchFallbackFonts) {
+		Path fontPath = Path(ASSETS_DIR) / relativePath;
+		if (!File::Exists(fontPath)) {
+			continue;
+		}
+		TTF_Font *openedFont = TTF_OpenFont(fontPath.ToString().c_str(), 24.0f);
+		if (!openedFont) {
+			ERROR_LOG(Log::G3D, "Switch: failed to open fallback font '%s'", fontPath.c_str());
+			continue;
+		}
+		const int numFaces = TTF_GetNumFontFaces(openedFont);
+		for (int k = 0; k < numFaces; k++) {
+			fallbackFontPaths_.push_back(std::make_pair(fontPath.ToString(), k));
+		}
+		TTF_CloseFont(openedFont);
+		INFO_LOG(Log::G3D, "Switch: fallback font '%s' registered (%d faces)", relativePath, numFaces);
+	}
+	if (fallbackFontPaths_.empty()) {
+		WARN_LOG(Log::G3D, "Switch: no fallback font found under '%sfonts/' - non-Latin text will be blank", ASSETS_DIR);
+	}
 #else
 	// We don't have a fallback font for this platform.
 	// Unsupported characters will be rendered as squares.

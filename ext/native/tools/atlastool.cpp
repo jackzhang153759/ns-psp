@@ -432,6 +432,10 @@ void GetLocales(const char *locales, std::vector<CharRange> &ranges)
 {
 	std::set<u16> kanji;
 	std::set<u16> hangul1, hangul2, hangul3;
+	// 本项目专用：完全由 assets/charset_cn.txt 决定的汉字集合，不走 kanjifilter 的 9500 字大表。
+	// 原因：原版图集只有 2397 个汉字，是因为当年字体(ARIALUNI)只覆盖了 2397 个；
+	// 换成覆盖两万字的微软雅黑后，9500 个全渲染出来会把图集撑到 2048x4146（超出 4096 上限，导致崩溃）。
+	std::set<u16> cjkExact;
 	for (int i = 0; i < sizeof(kanjiFilter) / sizeof(kanjiFilter[0]); i += 2)
 	{
 		// Kanji filtering.
@@ -443,6 +447,10 @@ void GetLocales(const char *locales, std::vector<CharRange> &ranges)
 	LearnFile("assets/lang/zh_CN.ini", "Chinese", kanji, 0x3400, 0xFFFF);
 	LearnFile("assets/lang/zh_TW.ini", "Chinese", kanji, 0x3400, 0xFFFF);
 	LearnFile("assets/langregion.ini", "Chinese", kanji, 0x3400, 0xFFFF);
+	// Switch 版没有 SDL3_ttf，UI 完全依赖本图集；原字符集只有日文汉字学习顺序表，
+	// 缺大量简体中文常用字（表现为问号）。这里补一份 GB2312 一级汉字 + 实际用到的汉字。
+	LearnFile("assets/charset_cn.txt", "Chinese", kanji, 0x3400, 0xFFFF);
+	LearnFile("assets/charset_cn.txt", "Chinese", cjkExact, 0x3400, 0xFFFF);
 	LearnFile("assets/lang/ko_KR.ini", "Korean", hangul1, 0x1100, 0x11FF);
 	LearnFile("assets/lang/ko_KR.ini", "Korean", hangul2, 0x3130, 0x318F);
 	LearnFile("assets/lang/ko_KR.ini", "Korean", hangul3, 0xAC00, 0xD7A3);
@@ -513,6 +521,11 @@ void GetLocales(const char *locales, std::vector<CharRange> &ranges)
 			ranges.push_back(range(0x2500, 0x254B)); // Box drawing
 			ranges.push_back(range(0x25A0, 0x266F)); // Geometric Shapes, Miscellaneous Symbols
 			break;
+		case 'z':  // 仅 assets/charset_cn.txt 里列出的汉字（完全可控，避免图集爆尺寸）
+			ranges.push_back(range(0x3000, 0x303F));  // Ideographic symbols
+			ranges.push_back(range(0x4E00, 0x9FFF, cjkExact));
+			break;
+
 		case 'c':  // All Kanji, filtered though!
 			ranges.push_back(range(0x3000, 0x303F));  // Ideographic symbols
 			ranges.push_back(range(0x4E00, 0x9FFF, kanji));

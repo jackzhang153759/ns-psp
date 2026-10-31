@@ -387,7 +387,9 @@ if(USE_LIBNX)
 	# naett (and with it http::HTTPSShutdown) isn't built for Switch - see ext/CMakeLists.txt -
 	# so HTTPS is unavailable here even though libcurl itself is present.
 	set(HTTPS_NOT_AVAILABLE ON)
-	set(PPSSPP_SWITCH_RELEASE_VERSION "1.0.0" CACHE STRING "PPSSPP Switch release version")
+	# FORCE: the value is cached across reconfigures, and a stale cache kept writing the old
+	# version into the .nacp even after this default changed.
+	set(PPSSPP_SWITCH_RELEASE_VERSION "1.20.4" CACHE STRING "PPSSPP Switch release version" FORCE)
 	add_compile_definitions(PPSSPP_SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION}")
 	find_path(SWITCH_CURL_INCLUDE_DIR curl/curl.h REQUIRED)
 	find_library(SWITCH_CURL_LIBRARY NAMES curl REQUIRED)
@@ -485,7 +487,24 @@ if(NOT LIBRETRO AND NOT IOS AND NOT HEADLESS_CROSS AND NOT ANDROID)
 			EGL glapi drm_nouveau
 			"$<LINK_ONLY:EGL>" "$<LINK_ONLY:glapi>" "$<LINK_ONLY:drm_nouveau>")
 		set_property(TARGET SDL3::SDL3-static PROPERTY INTERFACE_LINK_LIBRARIES "${SWITCH_SDL3_LINK_LIBRARIES}")
-		message(STATUS "Using SDL3 with atlas fonts")
+		# SDL3_ttf renders text with a real font instead of the pre-baked character atlas. The
+		# atlas has no CJK glyphs at all, so on Switch every Chinese character came out as '?'.
+		# Without it we keep the old atlas path, so a missing package degrades instead of failing.
+		find_package(SDL3_ttf QUIET)
+		if(SDL3_ttf_FOUND)
+			set(SDL_TTF_LIB_TARGET SDL3_ttf::SDL3_ttf)
+			add_compile_definitions(USE_SDL3_TTF)
+			# draw_text_sdl.cpp is compiled inside the ppsspp_ui/Core targets, which don't link
+			# SDL3_ttf themselves (only the final binary does), so its include directory has to be
+			# global - otherwise <SDL3_ttf/SDL_ttf.h> isn't found.
+			get_target_property(SWITCH_SDL3_TTF_INCLUDE_DIRS SDL3_ttf::SDL3_ttf INTERFACE_INCLUDE_DIRECTORIES)
+			if(SWITCH_SDL3_TTF_INCLUDE_DIRS)
+				include_directories(${SWITCH_SDL3_TTF_INCLUDE_DIRS})
+			endif()
+			message(STATUS "Using SDL3_ttf for text rendering (includes: ${SWITCH_SDL3_TTF_INCLUDE_DIRS})")
+		else()
+			message(STATUS "Using SDL3 with atlas fonts")
+		endif()
 	else()
 		set(SDL_LIB_TARGET SDL3::SDL3)
 		find_package(SDL3_ttf QUIET)
@@ -1727,7 +1746,7 @@ if(USE_LIBNX)
 	nx_generate_nacp(
 		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nacp"
 		NAME "PPSSPP"
-		AUTHOR "naga"
+		AUTHOR "龙魂猪猪"
 		VERSION "${PPSSPP_SWITCH_RELEASE_VERSION}"
 	)
 	nx_create_nro(PPSSPP_NRO

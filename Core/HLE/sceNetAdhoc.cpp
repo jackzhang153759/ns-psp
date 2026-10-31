@@ -57,6 +57,7 @@
 #include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/sceNetAdhoc.h"
+#include "Core/HLE/AdhocTransport.h"
 #include "Core/HLE/sceNet.h"
 #include "Core/HLE/proAdhocServer.h"
 #include "Core/HLE/KernelWaitHelpers.h"
@@ -99,6 +100,8 @@ int adhocctlPollEvent = -1;
 // When the game made its last request to the Adhoc Server, in emulated time. Its event isn't delivered
 // earlier than on a PSP (see PspEventDelayUs).
 static u64 adhocctlRequestTimeUs = 0;
+// Whether the pending DISCONNECT comes from ExitGameMode, which takes longer.
+static bool adhocctlDisconnectFromGameMode = false;
 // Whether the server has us in a group. The state the game sees only changes when the event is
 // delivered, so a Disconnect can come while a Create or Connect is still on its way.
 static bool adhocctlInServerGroup = false;
@@ -116,7 +119,10 @@ static int PspEventDelayUs(u32 flags) {
 		default: return getActivePeerCount() > 0 ? 3500000 : 4000000;
 		}
 	case ADHOCCTL_EVENT_SCAN: return 1015000;
-	case ADHOCCTL_EVENT_DISCONNECT: return 105000;
+	case ADHOCCTL_EVENT_DISCONNECT: return adhocctlDisconnectFromGameMode ? 650000 : 105000;
+	// GAMEMODE comes 4.38 s after CreateEnterGameMode, or 1.35 s after JoinEnterGameMode, whichever is
+	// later, to both at once (net/adhoc/pair/gamemodetiming).
+	case ADHOCCTL_EVENT_GAME: return adhocConnectionType == ADHOC_JOIN ? 1350000 : 4380000;
 	default: return 0;
 	}
 }
@@ -148,10 +154,6 @@ int gameModeNotifyEvent = -1;
 
 std::thread aemuPostofficeEnetThread;
 std::atomic<bool> aemuPostofficeEnetPumping = false;
-
-#define AEMU_POSTOFFICE_PORT 27313
-#define AEMU_POSTOFFICE_ID_BASE 2048
-#define RELAY_FAILURE_DISABLE_THRESHOLD_SEC 15
 
 // Without the local network permission, Android 17+ fails sends to LAN peers with EPERM.
 static void WarnIfLocalNetworkBlocked(int error) {
@@ -368,12 +370,24 @@ static AdhocDataMode AdhocGetServerDataMode(std::string_view server) {
 
 int AcceptPtpSocket(int ptpId, int newsocket, sockaddr_in& peeraddr, SceNetEtherAddr* addr, u16_le* port);
 int PollAdhocSocket(SceNetAdhocPollSd* sds, int count, int timeout, int nonblock);
-static int FindFreeAdhocSocketSlot();
+// A PSP hands out socket IDs in increasing order (pspautotests net/adhoc/ptp), starting over from 1
+// after sceNetAdhocTerm (pspautotests net/adhoc/socketids).
+static int nextAdhocSocketSlot = 0;
 int FlushPtpSocket(int socketId);
 int RecreatePtpSocket(int ptpId);
 int NetAdhocGameMode_DeleteMaster();
 int NetAdhocctl_ExitGameMode();
-int NetAdhocPtp_Connect(int id, int timeout, int flag, bool allowForcedConnect = true);
+
+
+static RelayTransport relayTransport;
+static P2PTransport p2pTransport;
+
+AdhocTransport &Transport() {
+	if (serverHasRelay) {
+		return relayTransport;
+	}
+	return p2pTransport;
+}
 
 // Forward declarations for the savestate mechanism (the matching is sadly not inside its own section)
 void deleteMatchingEvents(const int matchingId = -1);
@@ -452,11 +466,19 @@ static void __GameModeNotify(u64 userdata, int cyclesLate) {
 				return;
 			}
 
+			// After the initial sync, a PSP sends the master every period whether it changed or not, and the
+			// peers' replicas report each one as an update (pspautotests net/adhoc/pair/gamemodesync).
+			if (__KernelGetWaitID(threadID, WAITTYPE_NET, error) != GAMEMODE_WAITID || error != 0) {
+				masterGameModeArea.dataUpdated = 1;
+				for (auto &gma : replicaGameModeAreas)
+					gma.dataSent = 0;
+			}
+
 			// Send Master data
 			if (masterGameModeArea.dataUpdated) {
 				int sentcount = 0;
 				for (auto& gma : replicaGameModeAreas) {
-					if (!gma.dataSent && (serverHasRelay || IsSocketReady(sock->data.pdp.id, false, true) > 0)) {
+					if (!gma.dataSent && Transport().PdpReadyToSend(sock)) {
 						u16_le port = ADHOC_GAMEMODE_PORT;
 						auto it = gameModePeerPorts.find(gma.mac);
 						if (it != gameModePeerPorts.end())
@@ -519,13 +541,16 @@ static void __GameModeNotify(u64 userdata, int cyclesLate) {
 				}
 			}
 
-			// Recv new Replica data when available
-			if (serverHasRelay || IsSocketReady(sock->data.pdp.id, true, false) > 0) {
+			// Recv new Replica data when available. Every member sends every period, so take all that's there.
+			for (int packets = 0; packets < ADHOCCTL_GAMEMODE_MAX_MEMBERS * 2 && Transport().PdpReadyToRecv(sock); ++packets) {
 				SceNetEtherAddr sendermac;
 				s32_le senderport = ADHOC_GAMEMODE_PORT;
 				s32_le bufsz = gameModeBuffSize;
 				int ret = sceNetAdhocPdpRecv(currentMIPS, gameModeSocket, &sendermac, &senderport, gameModeBuffer, &bufsz, 0, ADHOC_F_NONBLOCK);
-				if (ret >= 0 && bufsz > 0) {
+				if (ret < 0 || bufsz <= 0) {
+					break;
+				}
+				{
 					// Shows a warning if the sender/source port is different than what it supposed to be.
 					if (senderport != ADHOC_GAMEMODE_PORT && senderport != gameModePeerPorts[sendermac]) {
 						char name[9] = {};
@@ -607,6 +632,7 @@ static void __AdhocctlNotify(u64 userdata, int cyclesLate) {
 				call_status = adhocctl_connect(adhocctlHandle, (char *)req.group.data);
 				if (call_status == ADHOCCTL_CALL_SUCCESS) {
 					adhocctlInServerGroup = true;
+					groupJoinInFlight = true;
 				}
 				break;
 			}
@@ -750,7 +776,7 @@ int StartGameModeScheduler() {
 	return 0;
 }
 
-static uint16_t offset_port_simple(uint16_t port) {
+uint16_t offset_port_simple(uint16_t port) {
 	if (port == 0) {
 		return 0;
 	}
@@ -761,157 +787,92 @@ static uint16_t offset_port_simple(uint16_t port) {
 	return port;
 }
 
-static uint16_t reverse_port_simple(uint16_t port) {
+uint16_t reverse_port_simple(uint16_t port) {
 	return port - portOffset;
-}
-
-static void handle_relay_connect_failure() {
-	auto n = GetI18NCategory(I18NCat::NETWORKING);
-	if (!trackingRelayFailure) {
-		trackingRelayFailure = true;
-		relayLastFailure = std::chrono::steady_clock::now();
-	}
-	int been_failing_since_sec = (std::chrono::steady_clock::now() - relayLastFailure) / std::chrono::seconds(1);
-	if (been_failing_since_sec < RELAY_FAILURE_DISABLE_THRESHOLD_SEC) {
-		g_OSD.Show(OSDType::MESSAGE_ERROR, n->T("Failed connecting to relay server"), 4.0f, "relay_status");
-	} else {
-		g_OSD.Show(OSDType::MESSAGE_ERROR, ApplySafeSubstitutions(n->T("Failed connecting to relay server for %1 seconds, relay disabled"), RELAY_FAILURE_DISABLE_THRESHOLD_SEC), 10.0f, "relay_status");
-		relayDisabled = true;
-	}
-}
-
-static void handle_relay_connect_success() {
-	auto n = GetI18NCategory(I18NCat::NETWORKING);
-	if (trackingRelayFailure) {
-		g_OSD.Show(OSDType::MESSAGE_SUCCESS, n->T("Connection to relay has recovered"), 2.0f, "relay_status");
-	}
-	if (relayFirstConnect) {
-		g_OSD.Show(OSDType::MESSAGE_SUCCESS, n->T("Connected to relay"), 2.0f, "relay_status");
-		relayFirstConnect = false;
-	}
-	trackingRelayFailure = false;
-}
-
-static void *pdp_postoffice_recover(int idx) {
-	if (relayDisabled) {
-		return NULL;
-	}
-
-	AdhocSocket *internal = adhocSockets[idx];
-	if (internal->postofficeHandle != NULL) {
-		return internal->postofficeHandle;
-	}
-
-	INFO_LOG(Log::sceNet, "%s: recovering pdp socket id %d", __func__, idx + 1);
-
-	struct aemu_postoffice_sock_addr addr;
-	auto server_ip = GetAdhocServerIP();
-	addr.addr = server_ip.in.sin_addr.s_addr;
-	addr.port = htons(AEMU_POSTOFFICE_PORT);
-
-	SceNetEtherAddr local_mac;
-	getLocalMac(&local_mac);
-
-	int state;
-	internal->postofficeHandle = pdp_create_v4(&addr, (const char *)&local_mac, offset_port_simple(internal->data.pdp.lport), netAdhocUseUdp, internal->postofficePdpEnetReliable, NULL, NULL, &state);
-	if (state != AEMU_POSTOFFICE_CLIENT_OK) {
-		ERROR_LOG(Log::sceNet, "%s: failed creating pdp socket on aemu postoffice library, %d", __func__, state);
-		handle_relay_connect_failure();
-	} else {
-		handle_relay_connect_success();
-	}
-
-	INFO_LOG(Log::sceNet, "%s: pdp recovery for id %d: %p", __func__, idx + 1, internal->postofficeHandle);
-	return internal->postofficeHandle;
-}
-
-static int pdp_peek_next_size_postoffice(int idx) {
-	AdhocSocket *internal = adhocSockets[idx];
-	void *pdp_sock = pdp_postoffice_recover(idx);
-	if (pdp_sock == NULL) {
-		return 0;
-	}
-	int peek_status = pdp_peek_next_size(pdp_sock);
-	if (peek_status == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-		pdp_delete(internal->postofficeHandle);
-		internal->postofficeHandle = NULL;
-		return 0;
-	}
-	return peek_status;
 }
 
 // Out of any group (from the moment Disconnect is called): a PSP's radio then reaches nobody, and nobody
 // reaches it.
-static bool offAdhocNetwork() {
+bool offAdhocNetwork() {
 	return !adhocctlInServerGroup;
 }
 
-static bool isLocalMac(const SceNetEtherAddr *mac) {
+bool NetAdhocctl_InServerGroup() {
+	return adhocctlInServerGroup;
+}
+
+void AbandonGroupJoin() {
+	// A queued join completes like a login, sending nothing. (The requests are saved in savestates, so
+	// it keeps the format.)
+	for (auto &it : adhocctlRequests) {
+		if (it.second.opcode == OPCODE_CONNECT) {
+			it.second.opcode = OPCODE_LOGIN;
+		}
+	}
+	if (groupJoinInFlight) {
+		groupJoinInFlight = false;
+		abandonedGroupJoins++;
+	}
+}
+
+bool isLocalMac(const SceNetEtherAddr *mac) {
 	SceNetEtherAddr localMac;
 	getLocalMac(&localMac);
 	return isMacMatch(&localMac, mac);
 }
 
-static void ptpSetEstablished(AdhocSocket *sock) {
+void ptpSetEstablished(AdhocSocket *sock) {
 	sock->data.ptp.state = ADHOC_PTP_STATE_ESTABLISHED;
 	sock->ptpEstablishedAt = CoreTiming::GetGlobalTimeUsScaled();
 }
 
+static void ptpUpdateConnecting(AdhocSocket *sock) {
+	if (sock->data.ptp.state != ADHOC_PTP_STATE_SYN_SENT && sock->data.ptp.state != ADHOC_PTP_STATE_SYN_RCVD) {
+		return;
+	}
+	if (Transport().PtpConnectionUp(sock)) {
+		ptpSetEstablished(sock);
+	}
+}
+
 // A PSP checks the age of a connection's oldest unacknowledged data every rexmt_int, counting from when
 // the connection was established, and drops the connection at the first check where that data is older
-// than (rexmt_cnt + 1) * rexmt_int (pspautotests net/adhoc/pair/vanishtiming). Data sent once the peer
-// has left is never acknowledged.
-static bool ptpPeerGone(const AdhocSocket *sock) {
+// than (rexmt_cnt + 1) * rexmt_int. A connection that only receives never fails
+// (pspautotests net/adhoc/pair/vanishtiming).
+bool ptpPeerGone(const AdhocSocket *sock) {
 	u64 leftAt = peerLeftAt(&sock->data.ptp.paddr);
 	if (leftAt == 0) {
+		return false;
+	}
+	// The oldest data the peer can't have acknowledged: sent after it left, or so shortly before that the
+	// acknowledgement couldn't come back (a round trip takes about 7 ms on a PSP).
+	u64 unackedSince = sock->ptpSendAfterPeerLeftAt;
+	if (sock->ptpLastSendAt != 0 && sock->ptpLastSendAt + 10000 >= leftAt && sock->ptpLastSendAt < leftAt) {
+		unackedSince = sock->ptpLastSendAt;
+	}
+	if (unackedSince == 0) {
 		return false;
 	}
 	u64 interval = (u64)std::max(1, sock->retry_interval);
 	u64 limit = interval * (u64)(std::max(0, sock->retry_count) + 1);
 	u64 now = CoreTiming::GetGlobalTimeUsScaled();
-	if (now - leftAt <= limit) {
+	if (now - unackedSince <= limit) {
 		return false;
 	}
 	// The last check, at or before now, has to be past the limit.
-	u64 base = std::min(sock->ptpEstablishedAt, leftAt);
+	u64 base = std::min(sock->ptpEstablishedAt, unackedSince);
 	u64 lastCheck = base + (now - base) / interval * interval;
-	return lastCheck > leftAt + limit;
+	return lastCheck > unackedSince + limit;
 }
 
-static int pdp_recv_postoffice(int idx, SceNetEtherAddr *saddr, uint16_t *sport, void *data, int *len) {
-	AdhocSocket *internal = adhocSockets[idx];
-	void *pdp_sock = pdp_postoffice_recover(idx);
-	if (pdp_sock == NULL) {
-		return SOCKET_ERROR;
+void ptpNoteSend(AdhocSocket *sock) {
+	u64 now = CoreTiming::GetGlobalTimeUsScaled();
+	if (peerLeftAt(&sock->data.ptp.paddr) == 0) {
+		sock->ptpSendAfterPeerLeftAt = 0;
+	} else if (sock->ptpSendAfterPeerLeftAt == 0) {
+		sock->ptpSendAfterPeerLeftAt = now;
 	}
-
-	int sport_copy = 0;
-	SceNetEtherAddr saddr_copy = {0};
-	int len_copy = *len;
-
-	int pdp_recv_status = pdp_recv(pdp_sock, (char *)&saddr_copy, &sport_copy, (char *)data, &len_copy, true);
-	if (pdp_recv_status == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-		handle_relay_connect_failure();
-		pdp_delete(internal->postofficeHandle);
-		internal->postofficeHandle = NULL;
-		return SOCKET_ERROR;
-	}
-	if (pdp_recv_status == AEMU_POSTOFFICE_CLIENT_SESSION_WOULD_BLOCK) {
-		return SOCKET_ERROR;
-	}
-	// Out of the group, nothing from anyone else reaches us (pspautotests net/adhoc/pair/vanish).
-	if (offAdhocNetwork() && !isLocalMac(&saddr_copy)) {
-		return SOCKET_ERROR;
-	}
-
-	*len = len_copy;
-	if (saddr != NULL) {
-		*saddr = saddr_copy;
-	}
-	if (sport != NULL) {
-		*sport = reverse_port_simple(sport_copy);
-	}
-	return 0;
+	sock->ptpLastSendAt = now;
 }
 
 int DoBlockingPdpRecv(AdhocSocketRequest& req, s64& result) {
@@ -920,181 +881,12 @@ int DoBlockingPdpRecv(AdhocSocketRequest& req, s64& result) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_DELETED;
 		return 0;
 	}
-	auto& pdpsocket = sock->data.pdp;
 	if (sock->flags & ADHOC_F_ALERTRECV) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_ALERTED;
 		sock->alerted_flags |= ADHOC_F_ALERTRECV;
 		return 0;
 	}
-
-	int ret;
-	int sockerr;
-	SceNetEtherAddr mac;
-	struct sockaddr_in sin;
-	socklen_t sinlen;
-
-	sinlen = sizeof(sin);
-	memset(&sin, 0, sinlen);
-
-	if (serverHasRelay) {
-		while(1) {
-			int next_size = pdp_peek_next_size_postoffice(req.id - 1);
-			if (next_size == 0) {
-				// no next packet
-				ret = SOCKET_ERROR;
-				sockerr = EAGAIN;
-				break;
-			}
-			if (next_size > *req.length) {
-				// next is larger than current buffer
-				result = SCE_NET_ADHOC_ERROR_NOT_ENOUGH_SPACE;
-				*req.length = next_size;
-				return 0;
-			}
-			ret = pdp_recv_postoffice(req.id - 1, req.remoteMAC, req.remotePort, req.buffer, req.length);
-			if (ret == 0) {
-				// we got data into the request
-				result = 0;
-				return 0;
-			}
-			ret = SOCKET_ERROR;
-			sockerr = EAGAIN;
-			break;
-		}
-	} else {
-		// On Windows: MSG_TRUNC are not supported on recvfrom (socket error WSAEOPNOTSUPP), so we use dummy buffer as an alternative
-		ret = recvfrom(pdpsocket.id, dummyPeekBuf64k, dummyPeekBuf64kSize, MSG_PEEK | MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-		sockerr = socket_errno;
-	}
-
-	// Discard packets from IP that can't be translated into MAC address to prevent confusing the game, since the sender MAC won't be updated and may contains invalid/undefined value.
-	// TODO: In order to discard packets from unresolvable IP (can't be translated into player's MAC) properly, we'll need to manage the socket buffer ourself,
-	//       by reading the whole available data, separates each datagram and discard unresolvable one, so we can calculate the correct number of available data to recv on GetPdpStat too.
-	//       We may also need to implement encryption (or a simple checksum will do) in order to validate the packet to findout whether it came from PPSSPP or a different App that may be sending/broadcasting data to the same port being used by a game
-	//       (in case the IP was resolvable but came from a different App, which will need to be discarded too)
-	if (ret != SOCKET_ERROR && !resolveIP(sin.sin_addr.s_addr, &mac)) {
-		// Remove the packet from socket buffer
-		sinlen = sizeof(sin);
-		memset(&sin, 0, sinlen);
-		recvfrom(pdpsocket.id, dummyPeekBuf64k, dummyPeekBuf64kSize, MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-		// Try again later, until timeout reached
-		u64 now = (u64)(time_now_d() * 1000000.0);
-		if (req.timeout != 0 && now - req.startTime > req.timeout) {
-			result = SCE_NET_ADHOC_ERROR_TIMEOUT;
-			DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i]: Discard Timeout", req.id);
-			return 0;
-		}
-		else
-			return -1;
-	}
-
-	// At this point we assumed that the packet is a valid PPSSPP packet. A datagram larger than the
-	// buffer isn't copied at all (pspautotests net/adhoc/pdp).
-
-	// Note: UDP must not be received partially, otherwise leftover data in socket's buffer will be discarded
-	if (ret >= 0 && ret <= *req.length) {
-		sinlen = sizeof(sin);
-        memset(&sin, 0, sinlen);
-		ret = recvfrom(pdpsocket.id, (char*)req.buffer, std::max(0, *req.length), MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-		// UDP can also receives 0 data, while on TCP receiving 0 data = connection gracefully closed, but not sure whether PDP can send/recv 0 data or not tho
-		*req.length = 0;
-		if (ret >= 0) {
-			DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Received %u bytes from %s:%u\n", req.id, getLocalPort(pdpsocket.id), ret, ip2str(sin.sin_addr).c_str(), ntohs(sin.sin_port));
-
-			// Find Peer MAC
-			if (resolveIP(sin.sin_addr.s_addr, &mac)) {
-				// Provide Sender Information
-				*req.remoteMAC = mac;
-				*req.remotePort = ntohs(sin.sin_port) - portOffset;
-
-				// Save Length
-				*req.length = ret;
-
-				// Update last recv timestamp
-				peerlock.lock();
-				auto peer = findFriend(&mac);
-				if (peer != NULL) peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
-				peerlock.unlock();
-			}
-			// Unknown Peer
-			else {
-				*req.length = ret;
-				*req.remotePort = ntohs(sin.sin_port) - portOffset;
-
-				WARN_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Received %i bytes from Unknown Peer %s:%u", req.id, getLocalPort(pdpsocket.id), ret, ip2str(sin.sin_addr).c_str(), ntohs(sin.sin_port));
-			}
-		}
-		result = 0;
-	}
-	// On Windows: recvfrom on UDP can get error WSAECONNRESET when previous sendto's destination is unreachable (or destination port is not bound yet), may need to disable SIO_UDP_CONNRESET error
-	else if (sockerr == EAGAIN || sockerr == EWOULDBLOCK || sockerr == ECONNRESET) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
-		if (req.timeout == 0 || now - req.startTime <= req.timeout) {
-			// Try again later
-			return -1;
-		}
-		else
-			result = SCE_NET_ADHOC_ERROR_TIMEOUT;
-	}
-	// Returning required buffer size when available data in recv buffer is larger than provided buffer size
-	else if (ret > *req.length) {
-		WARN_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Peeked %u/%u bytes from %s:%u\n", req.id, getLocalPort(pdpsocket.id), ret, *req.length, ip2str(sin.sin_addr).c_str(), ntohs(sin.sin_port));
-		*req.length = ret;
-
-		// Find Peer MAC
-		if (resolveIP(sin.sin_addr.s_addr, &mac)) {
-			// Provide Sender Information
-			*req.remoteMAC = mac;
-			*req.remotePort = ntohs(sin.sin_port) - portOffset;
-
-			// FIXME: Do we need to update last recv timestamp? eventhough data hasn't been retrieved yet (ie. peeked)
-			peerlock.lock();
-			auto peer = findFriend(&mac);
-			if (peer != NULL) peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
-			peerlock.unlock();
-		}
-		result = SCE_NET_ADHOC_ERROR_NOT_ENOUGH_SPACE;
-	}
-	// FIXME: Blocking operation with infinite timeout(0) should never get a TIMEOUT error, right? May be we should return INVALID_ARG instead if it was infinite timeout (0)?
-	else
-		result = SCE_NET_ADHOC_ERROR_TIMEOUT; // SCE_NET_ADHOC_ERROR_INVALID_ARG; // SCE_NET_ADHOC_ERROR_DISCONNECTED
-
-	if (ret == SOCKET_ERROR)
-		DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i]: Socket Error (%i)", req.id, sockerr);
-
-	return 0;
-}
-
-static int pdp_send_postoffice(int idx, const SceNetEtherAddr *daddr, uint16_t dport, const void *data, int len) {
-	AdhocSocket *internal = adhocSockets[idx];
-	void *pdp_sock = pdp_postoffice_recover(idx);
-	if (pdp_sock == NULL) {
-		return SOCKET_ERROR;
-	}
-
-	// Out of the group, it goes into the air and reaches nobody (pspautotests net/adhoc/pair/vanish).
-	if (offAdhocNetwork() && !isLocalMac(daddr)) {
-		return 0;
-	}
-
-	SceNetEtherAddr fixed_daddr = *daddr;
-	fixGameMac(&fixed_daddr);
-
-	int pdp_send_status = pdp_send(pdp_sock, (const char *)&fixed_daddr, offset_port_simple(dport), (char *)data, len, true);
-	if (pdp_send_status == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-		handle_relay_connect_failure();
-		pdp_delete(internal->postofficeHandle);
-		internal->postofficeHandle = NULL;
-		return SOCKET_ERROR;
-	}
-	if (pdp_send_status == AEMU_POSTOFFICE_CLIENT_SESSION_WOULD_BLOCK) {
-		return SOCKET_ERROR;
-	}
-	if (pdp_send_status == AEMU_POSTOFFICE_CLIENT_OUT_OF_MEMORY) {
-		// this is pretty critical
-		ERROR_LOG(Log::sceNet, "%s: critical: huge client buf %d what is going on please fix", __func__, len);
-	}
-	return 0;
+	return Transport().DoBlockingPdpRecv(req, result);
 }
 
 int DoBlockingPdpSend(AdhocSocketRequest& req, s64& result, AdhocSendTargets& targetPeers) {
@@ -1119,19 +911,8 @@ int DoBlockingPdpSend(AdhocSocketRequest& req, s64& result, AdhocSendTargets& ta
 		target.sin_addr.s_addr = peer->ip;
 		target.sin_port = htons(peer->port + peer->portOffset);
 
-		int ret = 0;
 		int sockerr = 0;
-		if (serverHasRelay) {
-			ret = pdp_send_postoffice(req.id - 1, &peer->mac, peer->port, req.buffer, targetPeers.length);
-			if (ret == 0) {
-				ret = targetPeers.length;
-			} else {
-				sockerr = EAGAIN;
-			}
-		} else {
-			ret = sendto(pdpsocket.id, (const char*)req.buffer, targetPeers.length, MSG_NOSIGNAL, (struct sockaddr*)&target, sizeof(target));
-			sockerr = socket_errno;
-		}
+		int ret = Transport().PdpSendTo(req.id, &peer->mac, peer->port, target, req.buffer, targetPeers.length, &sockerr);
 
 		if (ret >= 0) {
 			DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpSend[%i:%u](B): Sent %u bytes to %s:%u\n", req.id, getLocalPort(pdpsocket.id), ret, ip2str(target.sin_addr).c_str(), ntohs(target.sin_port));
@@ -1140,7 +921,7 @@ int DoBlockingPdpSend(AdhocSocketRequest& req, s64& result, AdhocSendTargets& ta
 		}
 		else {
 			if (ret == SOCKET_ERROR && (sockerr == EAGAIN || sockerr == EWOULDBLOCK)) {
-				u64 now = (u64)(time_now_d() * 1000000.0);
+				u64 now = CoreTiming::GetGlobalTimeUs();
 				if (req.timeout == 0 || now - req.startTime <= req.timeout) {
 					retry = true;
 				}
@@ -1161,168 +942,18 @@ int DoBlockingPdpSend(AdhocSocketRequest& req, s64& result, AdhocSendTargets& ta
 	return 0;
 }
 
-static int ptp_send_postoffice(int idx, const void *data, int *len) {
-	if (relayDisabled) {
-		return SOCKET_ERROR;
-	}
-
-	AdhocSocket *internal = adhocSockets[idx];
-
-	if (internal->postofficeHandle == NULL) {
-		// this should only happen on ptp_open sockets, where ptp_connect is still in progress on another thread
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	// Out of the group, the send succeeds and the data goes nowhere (pspautotests net/adhoc/pair/vanish).
-	if (offAdhocNetwork()) {
-		return 0;
-	}
-	if (ptpPeerGone(internal)) {
-		return SOCKET_ERROR;
-	}
-
-	if (*len > AEMU_POSTOFFICE_PTP_BLOCK_MAX) {
-		// force fragmentation for giant sends
-		*len = AEMU_POSTOFFICE_PTP_BLOCK_MAX;
-	}
-
-	int ptp_send_status = ptp_send(internal->postofficeHandle, (const char *)data, *len, true);
-	if (ptp_send_status == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-		// the session is dead, need to be reflected to the other side
-		// this is not necessarily a relay failure, could simply be the other side disconnecting
-		//handle_relay_connect_failure();
-		return SOCKET_ERROR;
-	}
-	if (ptp_send_status == AEMU_POSTOFFICE_CLIENT_SESSION_WOULD_BLOCK) {
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-	if (ptp_send_status == AEMU_POSTOFFICE_CLIENT_OUT_OF_MEMORY) {
-		// this is pretty critical
-		ERROR_LOG(Log::sceNet, "%s: critical: huge client buf %d what is going on please fix", __func__, len ? *len : 0);
-	}
-
-	return 0;
-}
-
 int DoBlockingPtpSend(AdhocSocketRequest& req, s64& result) {
 	auto sock = adhocSockets[req.id - 1];
 	if (!sock) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_DELETED;
 		return 0;
 	}
-	auto& ptpsocket = sock->data.ptp;
 	if (sock->flags & ADHOC_F_ALERTSEND) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_ALERTED;
 		sock->alerted_flags |= ADHOC_F_ALERTSEND;
 		return 0;
 	}
-
-	// Send Data
-	int ret = 0;
-	int sockerr = 0;
-	if (serverHasRelay) {
-		ret = ptp_send_postoffice(req.id - 1, req.buffer, req.length);
-		if (ret == 0) {
-			// sent
-			// Set to Established on successful Send when an attempt to Connect was initiated
-			if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT)
-				ptpSetEstablished(sock);
-
-			DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend[%i:%u]: Sent %u bytes to %s:%u\n", req.id, ptpsocket.lport, ret, mac2str(&ptpsocket.paddr).c_str(), ptpsocket.pport);
-
-			result = 0;
-			return 0;
-		}
-		if (ret == SOCKET_ERROR) {
-			ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-			result = SCE_NET_ADHOC_ERROR_DISCONNECTED;
-
-			DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend[%i]: Socket Error (%i)", req.id, sockerr);
-
-			return 0;
-		}
-		// SCE_NET_ADHOC_ERROR_WOULD_BLOCK
-		ret = SOCKET_ERROR;
-		sockerr = EAGAIN;
-	}else{
-		ret = send(ptpsocket.id, (const char*)req.buffer, *req.length, MSG_NOSIGNAL);
-		sockerr = socket_errno;
-	}
-
-	// Success
-	if (ret > 0) {
-		// Save Length
-		*req.length = ret;
-
-		DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend[%i:%u]: Sent %u bytes to %s:%u\n", req.id, ptpsocket.lport, ret, mac2str(&ptpsocket.paddr).c_str(), ptpsocket.pport);
-
-		// Set to Established on successful Send when an attempt to Connect was initiated
-		if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT)
-			ptpSetEstablished(sock);
-
-		// Return Success
-		result = 0;
-	}
-	else if (ret == SOCKET_ERROR && (sockerr == EAGAIN || sockerr == EWOULDBLOCK || (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT && (sockerr == ENOTCONN || connectInProgress(sockerr))))) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
-		if (req.timeout == 0 || now - req.startTime <= req.timeout) {
-			return -1;
-		}
-		else
-			result = SCE_NET_ADHOC_ERROR_TIMEOUT;
-	}
-	else {
-		// Change Socket State. // FIXME: Does Alerted Socket should be closed too?
-		ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-
-		// Disconnected
-		result = SCE_NET_ADHOC_ERROR_DISCONNECTED;
-	}
-
-	if (ret == SOCKET_ERROR)
-		DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend[%i]: Socket Error (%i)", req.id, sockerr);
-
-	return 0;
-}
-
-static int ptp_recv_postoffice(int idx, void *data, int *len) {
-	if (relayDisabled) {
-		return SOCKET_ERROR;
-	}
-
-	AdhocSocket *internal = adhocSockets[idx];
-
-	if (internal->postofficeHandle == NULL) {
-		// this should only happen on ptp_open sockets, where ptp_connect is still in progress on another thread
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	// Out of the group, nothing arrives, and the connection doesn't fail either (pspautotests
-	// net/adhoc/pair/vanish).
-	if (offAdhocNetwork()) {
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-	if (ptpPeerGone(internal)) {
-		return SOCKET_ERROR;
-	}
-
-	int len_copy = *len;
-
-	int ptp_recv_status = ptp_recv(internal->postofficeHandle, (char *)data, &len_copy, true);
-	if (ptp_recv_status == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-		// the session is dead, need to be reflected to the other side
-		// this is not necessarily a relay failure, could simply be the other side disconnecting
-		//handle_relay_connect_failure();
-		return SOCKET_ERROR;
-	}
-	if (ptp_recv_status == AEMU_POSTOFFICE_CLIENT_SESSION_WOULD_BLOCK) {
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	// AEMU_POSTOFFICE_CLIENT_SESSION_DATA_TRUNC is okay, it just means it has data in it's user space buffer
-
-	*len = len_copy;
-	return 0;
+	return Transport().DoBlockingPtpSend(req, result);
 }
 
 int DoBlockingPtpRecv(AdhocSocketRequest& req, s64& result) {
@@ -1331,185 +962,12 @@ int DoBlockingPtpRecv(AdhocSocketRequest& req, s64& result) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_DELETED;
 		return 0;
 	}
-	auto& ptpsocket = sock->data.ptp;
 	if (sock->flags & ADHOC_F_ALERTRECV) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_ALERTED;
 		sock->alerted_flags |= ADHOC_F_ALERTRECV;
 		return 0;
 	}
-
-	int ret = 0;
-	int sockerr = 0;
-	if (serverHasRelay) {
-		ret = ptp_recv_postoffice(req.id - 1, req.buffer, req.length);
-		if (ret == 0) {
-			// we got data
-			result = 0;
-			return 0;
-		}
-		if (ret == SOCKET_ERROR) {
-			// the socket died, let the game know
-			ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-			result = SCE_NET_ADHOC_ERROR_DISCONNECTED;
-			return 0;
-		}
-		// SCE_NET_ADHOC_ERROR_WOULD_BLOCK
-		ret = SOCKET_ERROR;
-		sockerr = EAGAIN;
-	} else {
-		ret = recv(ptpsocket.id, (char*)req.buffer, std::max(0, *req.length), MSG_NOSIGNAL);
-		sockerr = socket_errno;
-	}
-
-	// Received Data. POSIX: May received 0 bytes when the remote peer already closed the connection.
-	if (ret > 0) {
-		DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv[%i:%u]: Received %u bytes from %s:%u\n", req.id, ptpsocket.lport, ret, mac2str(&ptpsocket.paddr).c_str(), ptpsocket.pport);
-		// Save Length
-		*req.length = ret;
-
-		// Update last recv timestamp
-		peerlock.lock();
-		auto peer = findFriend(&ptpsocket.paddr);
-		if (peer != NULL) peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
-		peerlock.unlock();
-
-		// Set to Established on successful Recv when an attempt to Connect was initiated
-		if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT)
-			ptpSetEstablished(sock);
-
-		result = 0;
-	}
-	else if (ret == SOCKET_ERROR && (sockerr == EAGAIN || sockerr == EWOULDBLOCK || (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT && (sockerr == ENOTCONN || connectInProgress(sockerr))))) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
-		if (req.timeout == 0 || now - req.startTime <= req.timeout) {
-			return -1;
-		}
-		else
-			result = SCE_NET_ADHOC_ERROR_TIMEOUT;
-	}
-	else {
-		// Change Socket State. // FIXME: Does Alerted Socket should be closed too?
-		ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-
-		// Disconnected
-		result = SCE_NET_ADHOC_ERROR_DISCONNECTED; // SCE_NET_ADHOC_ERROR_INVALID_ARG
-	}
-
-	if (ret == SOCKET_ERROR)
-		DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv[%i]: Socket Error (%i)", req.id, sockerr);
-
-	return 0;
-}
-
-static void *ptp_listen_postoffice_recover(int idx) {
-	if (relayDisabled) {
-		return NULL;
-	}
-
-	AdhocSocket *internal = adhocSockets[idx];
-	if (internal->postofficeHandle != NULL) {
-		return internal->postofficeHandle;
-	}
-
-	INFO_LOG(Log::sceNet, "%s: recovering ptp listen socket id %d", __func__, idx + 1);
-
-	struct aemu_postoffice_sock_addr addr;
-	auto server_ip = GetAdhocServerIP();
-	addr.addr = server_ip.in.sin_addr.s_addr;
-	addr.port = htons(AEMU_POSTOFFICE_PORT);
-
-	int state;
-	internal->postofficeHandle = ptp_listen_v4(&addr, (const char*)&internal->data.ptp.laddr, internal->data.ptp.lport + portOffset, netAdhocUseUdp, NULL, NULL, &state);
-
-	if (state != AEMU_POSTOFFICE_CLIENT_OK) {
-		ERROR_LOG(Log::sceNet, "%s: failed recovering ptp listen socket, %d", __func__, state);
-		handle_relay_connect_failure();
-	} else {
-		handle_relay_connect_success();
-	}
-
-	INFO_LOG(Log::sceNet, "%s: ptp listen recovery for id %d: %p", __func__, idx + 1, internal->postofficeHandle);
-
-	return internal->postofficeHandle;
-}
-
-static int ptp_accept_postoffice(int idx, SceNetEtherAddr *saddr, uint16_t *sport) {
-	void *ptp_listen_socket = ptp_listen_postoffice_recover(idx);
-
-	if (ptp_listen_socket == NULL) {
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	int state = 0;
-	int port_cpy = 0;
-	SceNetEtherAddr mac_cpy = {0};
-	void *new_ptp_socket = ptp_accept(ptp_listen_socket, (char *)&mac_cpy, &port_cpy, true, NULL, NULL, &state);
-	if (new_ptp_socket == NULL) {
-		if (state == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-			handle_relay_connect_failure();
-			ptp_listen_close(adhocSockets[idx]->postofficeHandle);
-			adhocSockets[idx]->postofficeHandle = NULL;
-			return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-		}
-		if (state == AEMU_POSTOFFICE_CLIENT_OUT_OF_MEMORY) {
-			// pretty critical here
-			ERROR_LOG(Log::sceNet, "%s: aemu_postoffice ran out of memory to accept a new connection", __func__);
-		}
-		// AEMU_POSTOFFICE_CLIENT_SESSION_WOULD_BLOCK
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	// we have a new socket
-	handle_relay_connect_success();
-	AdhocSocket *internal = (AdhocSocket *)malloc(sizeof(AdhocSocket));
-	if (internal == NULL) {
-		ERROR_LOG(Log::sceNet, "%s: critical: ran out of heap memory while accepting new connection", __func__);
-		ptp_close(new_ptp_socket);
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-	memset(internal, 0, sizeof(AdhocSocket));
-	internal->retry_interval = adhocSockets[idx]->retry_interval;
-	internal->retry_count = adhocSockets[idx]->retry_count;
-	internal->attemptCount = 1; // Connected, so a closed socket reports DISCONNECTED (as the native accept does)
-
-	internal->type = SOCK_PTP;
-	internal->postofficeHandle = new_ptp_socket;
-	internal->data.ptp.laddr = adhocSockets[idx]->data.ptp.laddr;
-	internal->data.ptp.lport = adhocSockets[idx]->data.ptp.lport;
-	internal->data.ptp.paddr = mac_cpy;
-	internal->data.ptp.pport = reverse_port_simple(port_cpy);
-	ptpSetEstablished(internal);
-	internal->data.ptp.rcv_sb_cc = adhocSockets[idx]->data.ptp.rcv_sb_cc;
-	internal->data.ptp.snd_sb_cc = adhocSockets[idx]->data.ptp.snd_sb_cc;
-	internal->data.ptp.id = AEMU_POSTOFFICE_ID_BASE + idx;
-	internal->flags = 0;
-	internal->connectThread = NULL;
-
-	AdhocSocket **slot = NULL;
-	int i;
-	i = FindFreeAdhocSocketSlot();
-	if (i < MAX_SOCKET) {
-		slot = &adhocSockets[i];
-	}
-
-	if (slot == NULL) {
-		ptp_close(new_ptp_socket);
-		free(internal);
-		ERROR_LOG(Log::sceNet, "%s: critical: cannot find an empty mapper slot", __func__);
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	*slot = internal;
-
-	if (saddr != NULL) {
-		*saddr = mac_cpy;
-	}
-	if (sport != NULL) {
-		*sport = reverse_port_simple(port_cpy);
-	}
-
-	INFO_LOG(Log::sceNet, "%s: accepted ptp socket with id %d %p", __func__, i + 1, internal->postofficeHandle);
-	return i + 1;
+	return Transport().DoBlockingPtpRecv(req, result);
 }
 
 int DoBlockingPtpAccept(AdhocSocketRequest& req, s64& result) {
@@ -1518,115 +976,12 @@ int DoBlockingPtpAccept(AdhocSocketRequest& req, s64& result) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_DELETED;
 		return 0;
 	}
-	auto& ptpsocket = sock->data.ptp;
 	if (sock->flags & ADHOC_F_ALERTACCEPT) {
 		result = SCE_NET_ADHOC_ERROR_SOCKET_ALERTED;
 		sock->alerted_flags |= ADHOC_F_ALERTACCEPT;
 		return 0;
 	}
-
-	struct sockaddr_in sin;
-	memset(&sin, 0, sizeof(sin));
-	socklen_t sinlen = sizeof(sin);
-	int ret, sockerr;
-
-	if (serverHasRelay) {
-		ret = ptp_accept_postoffice(req.id - 1, req.remoteMAC, req.remotePort);
-		if (ret >= 0) {
-			result = ret;
-			return 0;
-		} else {
-			ret = SOCKET_ERROR;
-			sockerr = EAGAIN;
-		}
-	} else {
-		// Check if listening socket is ready to accept
-		ret = IsSocketReady(ptpsocket.id, true, false, &sockerr);
-		if (ret > 0) {
-			// Accept Connection
-			ret = accept(ptpsocket.id, (struct sockaddr*)&sin, &sinlen);
-			sockerr = socket_errno;
-		}
-	}
-
-	// Accepted New Connection
-	if (ret > 0) {
-		int newid = AcceptPtpSocket(req.id, ret, sin, req.remoteMAC, req.remotePort);
-		if (newid > 0)
-			result = newid;
-	}
-	else if (ret == 0 || (ret == SOCKET_ERROR && (sockerr == EAGAIN || sockerr == EWOULDBLOCK))) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
-		if (req.timeout == 0 || now - req.startTime <= req.timeout) {
-			return -1;
-		}
-		else {
-				result = SCE_NET_ADHOC_ERROR_TIMEOUT;
-		}
-	}
-	else
-		result = SCE_NET_ADHOC_ERROR_INVALID_ARG; //SCE_NET_ADHOC_ERROR_TIMEOUT
-
-	if (ret == SOCKET_ERROR)
-		DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpAccept[%i]: Socket Error (%i)", req.id, sockerr);
-
-	return 0;
-}
-
-static int ptp_connect_postoffice(int idx, const char *caller) {
-	if (relayDisabled) {
-		return SCE_NET_ADHOC_ERROR_CONNECTION_REFUSED;
-	}
-
-	AdhocSocket *internal = adhocSockets[idx];
-
-	struct aemu_postoffice_sock_addr addr;
-	auto server_ip = GetAdhocServerIP();
-	addr.addr = server_ip.in.sin_addr.s_addr;
-	addr.port = htons(AEMU_POSTOFFICE_PORT);
-
-	if (internal->postofficeHandle != NULL) {
-		return 0;
-	}
-
-	if (internal->connectThreadDone) {
-		if (internal->connectThread != NULL) {
-			internal->connectThread->join();
-			delete internal->connectThread;
-			internal->connectThread = NULL;
-		}
-
-		internal->connectThreadDone = false;
-		internal->connectThreadResult = 0;
-
-		internal->connectThread = new std::thread([internal, addr, idx] {
-			int state;
-			SceNetEtherAddr fixed_daddr = internal->data.ptp.paddr;
-			fixGameMac(&fixed_daddr);
-			void *ptp_socket = ptp_connect_v4(&addr, (const char *)&internal->data.ptp.laddr, offset_port_simple(internal->data.ptp.lport), (const char *)&fixed_daddr, offset_port_simple(internal->data.ptp.pport), netAdhocUseUdp, NULL, NULL, &state);
-			if (ptp_socket == NULL) {
-				internal->connectThreadResult = SCE_NET_ADHOC_ERROR_CONNECTION_REFUSED;
-				ERROR_LOG(Log::sceNet, "%s: failed connecting to ptp socket, %d", __func__, state);
-				// do not count ptp connect failure as relay failure, since it could be the other client not accepting the connection
-				//handle_relay_connect_failure();
-				internal->connectThreadDone = true;
-				return;
-			}
-			// see above, ptp connect result is not used for checking if relay is working
-			//handle_relay_connect_success();
-			internal->postofficeHandle = ptp_socket;
-			internal->connectThreadResult = 0;
-			INFO_LOG(Log::sceNet, "%s: connected ptp socket with id %d %p", __func__, idx + 1, internal->postofficeHandle);
-			internal->connectThreadDone = true;
-			return;
-		});;
-
-		DEBUG_LOG(Log::sceNet, "%s: started connect thread on id %d", __func__, idx + 1);
-		return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
-	}
-
-	DEBUG_LOG(Log::sceNet, "%s: id %d is connecting", __func__, idx + 1);
-	return SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
+	return Transport().DoBlockingPtpAccept(req, result);
 }
 
 int DoBlockingPtpConnect(AdhocSocketRequest& req, s64& result, AdhocSendTargets& targetPeer) {
@@ -1650,16 +1005,7 @@ int DoBlockingPtpConnect(AdhocSocketRequest& req, s64& result, AdhocSendTargets&
 		sin.sin_addr.s_addr = targetPeer.peers[0].ip;
 		sin.sin_port = htons(ptpsocket.pport + targetPeer.peers[0].portOffset);
 
-		if (serverHasRelay) {
-			ret = ptp_connect_postoffice(req.id - 1, __func__);
-			if (ret != 0) {
-				ret = SOCKET_ERROR;
-				sockerr = EAGAIN;
-			}
-		} else {
-			ret = connect(ptpsocket.id, (struct sockaddr*)&sin, sizeof(sin));
-			sockerr = socket_errno;
-		}
+		ret = Transport().PtpConnect(req.id, sin, &sockerr);
 		if (sockerr != 0)
 			DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpConnect[%i:%u]: connect(%i) error = %i", req.id, ptpsocket.lport, ptpsocket.id, sockerr);
 		else
@@ -1668,22 +1014,7 @@ int DoBlockingPtpConnect(AdhocSocketRequest& req, s64& result, AdhocSendTargets&
 	// Check the connection state (assuming "connect" has been called before and is in-progress)
 	// Note: On Linux "select" can return > 0 (with SO_ERROR = 0) even when the connection is not accepted yet, thus need "getpeername" to ensure
 	else {
-		if (serverHasRelay) {
-			if (sock->postofficeHandle == NULL) {
-				ret = SOCKET_ERROR;
-				if (sock->connectThreadDone && sock->connectThreadResult == SCE_NET_ADHOC_ERROR_CONNECTION_REFUSED) {
-					sockerr = ECONNREFUSED;
-				} else {
-					sockerr = EAGAIN;
-				}
-			} else {
-				// the handle is there, we're ready to go
-				ret = 1;
-				sockerr = 0;
-			}
-		} else {
-			ret = IsSocketReady(ptpsocket.id, false, true, &sockerr);
-		}
+		ret = Transport().PtpConnectPoll(sock, &sockerr);
 		DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpConnect[%i:%u]: Select(%i) = %i, error = %i", req.id, ptpsocket.lport, ptpsocket.id, ret, sockerr);
 		if (sockerr != 0) {
 			DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpConnect[%i:%u]: SelectError(%i) = %i", req.id, ptpsocket.lport, ptpsocket.id, sockerr);
@@ -1698,15 +1029,8 @@ int DoBlockingPtpConnect(AdhocSocketRequest& req, s64& result, AdhocSendTargets&
 	}
 
 	// Check whether the connection has been established or not
-	if (!serverHasRelay && ret != SOCKET_ERROR) {
-		socklen_t sinlen = sizeof(sin);
-		// Note: "getpeername" shouldn't failed if the connection has been established, but on Windows it may succeed even when "connect" is still in-progress and not accepted yet (ie. "Tales of VS" on Windows)
-		ret = getpeername(ptpsocket.id, (struct sockaddr*)&sin, &sinlen);
-		if (ret == SOCKET_ERROR) {
-			int err = socket_errno;
-			VERBOSE_LOG(Log::sceNet, "sceNetAdhocPtpConnect[%i:%u]: getpeername(%i) error %i, sockerr = %i", req.id, ptpsocket.lport, ptpsocket.id, err, sockerr);
-			sockerr = err;
-		}
+	if (ret != SOCKET_ERROR) {
+		ret = Transport().PtpConnectVerify(req.id, &sin, ret, &sockerr);
 	}
 
 	// Update Adhoc Socket state
@@ -1717,7 +1041,7 @@ int DoBlockingPtpConnect(AdhocSocketRequest& req, s64& result, AdhocSendTargets&
 		// Done
 		result = 0;
 	}
-	else if (serverHasRelay || connectInProgress(sockerr) /* || sockerr == 0*/) {
+	else if (Transport().PtpConnectPending(sockerr) /* || sockerr == 0*/) {
 		ptpsocket.state = ADHOC_PTP_STATE_SYN_SENT;
 	}
 	// On Windows you can call connect again using the same socket after ECONNREFUSED/ETIMEDOUT/ENETUNREACH error, but on non-Windows you'll need to recreate the socket first
@@ -1735,7 +1059,7 @@ int DoBlockingPtpConnect(AdhocSocketRequest& req, s64& result, AdhocSendTargets&
 
 	// Still in progress, try again next time until Timedout
 	if (ptpsocket.state != ADHOC_PTP_STATE_ESTABLISHED) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
+		u64 now = CoreTiming::GetGlobalTimeUs();
 		if (req.timeout == 0 || now - req.startTime <= req.timeout) {
 			// Try again later
 			return -1;
@@ -1776,7 +1100,7 @@ int DoBlockingPtpFlush(AdhocSocketRequest& req, s64& result) {
 	result = 0;
 
 	if (sockerr == EAGAIN || sockerr == EWOULDBLOCK) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
+		u64 now = CoreTiming::GetGlobalTimeUs();
 		if (req.timeout == 0 || now - req.startTime <= req.timeout) {
 			return -1;
 		}
@@ -1798,7 +1122,7 @@ int DoBlockingAdhocPollSocket(AdhocSocketRequest& req, s64& result) {
 		// A disconnected socket or a poll alert ends the wait at once.
 		ret = SCE_NET_ADHOC_ERROR_EXCEPTION_EVENT;
 	} else if (ret == 0) {
-		u64 now = (u64)(time_now_d() * 1000000.0);
+		u64 now = CoreTiming::GetGlobalTimeUs();
 		// A timeout of 0 waits forever, like the rest of sceNet.
 		if (static_cast<int>(req.timeout) <= 0 || now - req.startTime <= req.timeout) {
 			return -1;
@@ -1940,7 +1264,8 @@ int WaitBlockingAdhocSocket(u64 threadSocketId, int type, int pspSocketId, void*
 	if (tmout > 0)
 		tmout = std::max(tmout, minSocketTimeoutUS);
 
-	u64 startTime = (u64)(time_now_d() * 1000000.0);
+	// Timeouts are the PSP's, so they run on the emulated clock.
+	u64 startTime = CoreTiming::GetGlobalTimeUs();
 	adhocSocketRequests[threadSocketId] = { type, pspSocketId, buffer, len, tmout, startTime, remoteMAC, remotePort };
 	// Some games (ie. Hitman Reborn Battle Arena 2) are using as small as 50 usec timeout
 	CoreTiming::ScheduleEvent(usToCycles(1), adhocSocketNotifyEvent, threadSocketId);
@@ -2100,6 +1425,8 @@ void __NetAdhocDoState(PointerWrap &p) {
 		Do(p, isAdhocctlBusy);
 		Do(p, netAdhocGameModeEntered);
 		Do(p, netAdhocEnterGameModeTimeout);
+		// Not saved: a game mode being entered gets its whole timeout again after a load.
+		gameModeEnterTimeUs = CoreTiming::GetGlobalTimeUs();
 	}
 	else {
 		isAdhocctlBusy = false;
@@ -2189,6 +1516,7 @@ void __UpdateAdhocctlHandlers(u32 flag, u32 error) {
 }
 
 void NetAdhocctl_GameModeTimedOut() {
+	AbandonGroupJoin();
 	if (adhocctlInServerGroup) {
 		const std::lock_guard<std::mutex> adhocctl_guard(adhocctlMutex);
 		if (adhocctlHandle != NULL) {
@@ -2237,6 +1565,7 @@ static void aemu_postoffice_server_log(const char *format, ...) {
 #endif
 
 void __NetAdhocInit() {
+	nextAdhocSocketSlot = 0;
 	friendFinderRunning = false;
 	netAdhocInited = false;
 	netAdhocctlInited = false;
@@ -2343,6 +1672,10 @@ int sceNetAdhocctlInit(MIPSState *mips, int stackSize, int prio, u32 productAddr
 	// FIXME: Sometimes returning 0x80410601 (SCE_NET_ADHOC_ERROR_AUTH_ALREADY_INITIALIZED / Library module is already initialized ?) when AdhocctlTerm is not fully done?
 
 	if (netAdhocctlInited) {
+		// On a PSP this also leaves adhocctl uninitialized (GetState fails with NOT_INITIALIZED), and
+		// a further Init fails with AUTH_ALREADY_INITIALIZED until Term (pspautotests net/adhoc/adhocctl).
+		// Not emulated: a game doing this would lose its connection, and none has been seen to.
+		ERROR_LOG_REPORT(Log::sceNet, "sceNetAdhocctlInit called while already initialized - a PSP would now be left uninitialized, which isn't emulated");
 		return hleLogError(Log::sceNet, SCE_NET_ADHOCCTL_ERROR_ALREADY_INITIALIZED);
 	}
 
@@ -2412,52 +1745,10 @@ int sceNetAdhocctlGetState(u32 ptrToStatus) {
 	return hleLogVerbose(Log::sceNet, 0, "state = %d", state);
 }
 
-static int pdp_create_postoffice(const SceNetEtherAddr *saddr, int sport, int bufsize, bool enet_reliable) {
-	if (relayDisabled) {
-		return hleLogDebug(Log::sceNet, ERROR_NET_NO_SPACE, "relay disabled");
-	}
-
-	AdhocSocket *internal = (AdhocSocket*)malloc(sizeof(AdhocSocket));
-	if (internal == NULL) {
-		return hleLogDebug(Log::sceNet, ERROR_NET_NO_SPACE, "net no space");
-	}
-	memset(internal, 0, sizeof(AdhocSocket));
-
-	internal->type = SOCK_PDP;
-	internal->postofficeHandle = NULL;
-	internal->data.pdp.laddr = *saddr;
-	internal->data.pdp.lport = sport;
-	internal->data.pdp.rcv_sb_cc = bufsize;
-	internal->flags = 0;
-	internal->lastAttempt = 0;
-	internal->internalLastAttempt = 0;
-	internal->postofficePdpEnetReliable = enet_reliable;
-
-	AdhocSocket **free_slot = NULL;
-	int i;
-	i = FindFreeAdhocSocketSlot();
-	if (i < MAX_SOCKET) {
-		free_slot = &adhocSockets[i];
-	}
-	if (free_slot == NULL) {
-		free(internal);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	internal->data.pdp.id = AEMU_POSTOFFICE_ID_BASE + i;
-
-	*free_slot = internal;
-	pdp_postoffice_recover(i);
-	INFO_LOG(Log::sceNet, "%s: created pdp socket with id %d %p", __func__, i + 1, internal->postofficeHandle);
-	return i + 1;
-}
-
 // Out of socket IDs is its own error (pspautotests net/adhoc/limits).
-// A PSP hands out socket IDs in increasing order (pspautotests net/adhoc/ptp), so the search for a free
-// slot starts after the last one handed out, and wraps around. Returns MAX_SOCKET when all are taken.
-static int nextAdhocSocketSlot = 0;
-
-static int FindFreeAdhocSocketSlot() {
+// The search for a free slot starts after the last one handed out, and wraps around (see
+// nextAdhocSocketSlot). Returns MAX_SOCKET when all are taken.
+int FindFreeAdhocSocketSlot() {
 	for (int n = 0; n < MAX_SOCKET; n++) {
 		int i = (nextAdhocSocketSlot + n) % MAX_SOCKET;
 		if (adhocSockets[i] == NULL) {
@@ -2483,7 +1774,7 @@ static bool HasFreeAdhocSocketSlot() {
 }
 
 // A free local port for a PDP socket created on port 0, in the range a PSP picks from (0x1000-0x7FFF).
-static uint16_t get_unused_pdp_port() {
+uint16_t get_unused_pdp_port() {
 	for (int tries = 0; tries < 1000; tries++) {
 		uint16_t test_port = 0x1000 + rand() % 0x7000;
 		bool used = false;
@@ -2558,9 +1849,12 @@ int NetAdhocPdpCreate(const char *mac, int port, int bufferSize, u32 flag, bool 
 	}
 
 	SceNetEtherAddr * saddr = (SceNetEtherAddr *)mac;
-	// Some games (ie. DBZ Shin Budokai 2) might be getting the saddr/srcmac content from SaveState and causing problems :( So we try to fix it here
+	// Some games (ie. DBZ Shin Budokai 2) might be getting the saddr/srcmac content from SaveState and causing problems :( So we
+	// use the local MAC instead, without writing it into the game's memory.
+	SceNetEtherAddr localSrcMac;
 	if (saddr != NULL) {
-		getLocalMac(saddr);
+		getLocalMac(&localSrcMac);
+		saddr = &localSrcMac;
 	}
 
 
@@ -2569,134 +1863,7 @@ int NetAdhocPdpCreate(const char *mac, int port, int bufferSize, u32 flag, bool 
 		return SCE_NET_ADHOC_ERROR_INVALID_ADDR;
 	}
 
-	if (serverHasRelay)
-		return pdp_create_postoffice(saddr, port, bufferSize, postoffice_enet_pdp_reliable);
-
-	// Create Internet UDP Socket
-	// Socket is remapped through adhocSockets
-	int usocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-
-	if (usocket == INVALID_SOCKET) {
-		DEBUG_LOG(Log::sceNet, "%s: sock creation failed", __func__);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	// Change socket buffer size to be consistent on all platforms.
-	// Send Buffer should be smaller than Recv Buffer to prevent faster device from flooding slower device too much.
-	setSockBufferSize(usocket, SO_SNDBUF, bufferSize*5); //PSP_ADHOC_PDP_MFS
-	// Recv Buffer should be equal or larger than Send Buffer. Using larger Recv Buffer might helped reduces dropped packets during a slowdown, but too large may cause slow performance on Warriors Orochi 2.
-	setSockBufferSize(usocket, SO_RCVBUF, bufferSize*10); //PSP_ADHOC_PDP_MFS*10
-
-	// Ignore SIGPIPE when supported (ie. BSD/MacOS)
-	setSockNoSIGPIPE(usocket, 1);
-
-	// Enable Port Re-use, this will allow binding to an already used port, but only one of them can read the data (shared receive buffer?)
-	setSockReuseAddrPort(usocket);
-
-	// Disable Connection Reset error on UDP to avoid strange behavior https://stackoverflow.com/questions/34242622/windows-udp-sockets-recvfrom-fails-with-error-10054
-	setUDPConnReset(usocket, false);
-
-	// Binding Information for local Port
-	struct sockaddr_in addr {};
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
-	if (isLocalServer) {
-		getLocalIp(&addr);
-	}
-	uint16_t requestedport = static_cast<int>(port + static_cast<int>(portOffset));
-	// Avoid getting random port due to port offset when original port wasn't 0 (ie. original_port + port_offset = 65536 = 0)
-	if (requestedport == 0 && port > 0)
-		requestedport = 65535; // Hopefully it will be safe to default it to 65535 since there can't be more than one port that can bumped into 65536
-
-	// Show a warning about privileged ports
-	if (requestedport != 0 && requestedport < 1024) {
-		WARN_LOG(Log::sceNet, "sceNetAdhocPdpCreate - Ports below 1024(ie. %hu) may require Admin Privileges", requestedport);
-	}
-	addr.sin_port = htons(requestedport);
-
-
-	// Bound Socket to local Port
-	int iResult = bind(usocket, (struct sockaddr*)&addr, sizeof(addr));
-	// A port picked for port 0 may be taken on the host; pick another.
-	for (int tries = 0; iResult != 0 && isClient && tries < 16; tries++) {
-		port = get_unused_pdp_port();
-		requestedport = static_cast<int>(port + static_cast<int>(portOffset));
-		if (requestedport == 0)
-			requestedport = 65535;
-		addr.sin_port = htons(requestedport);
-		iResult = bind(usocket, (struct sockaddr*)&addr, sizeof(addr));
-	}
-
-	if (iResult != 0) {
-		DEBUG_LOG(Log::sceNet, "%s: sock bind failed", __func__);
-		auto n = GetI18NCategory(I18NCat::NETWORKING);
-		g_OSD.Show(OSDType::MESSAGE_ERROR, std::string(n->T("Failed to Bind Port")) + " " + std::to_string(port + portOffset) + "\n" + std::string(n->T("Please change your Port Offset")), 0.0f, "portbindfail");
-		closesocket(usocket);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	// Workaround: Send a dummy 0 size message to AdhocServer IP to make sure the socket actually bound to an address when binded with INADDR_ANY before using getsockname, seems to fix sending from incorrect port issue on MGS:PW on Android
-	auto server_ip = GetAdhocServerIP();
-	addr.sin_addr.s_addr = server_ip.in.sin_addr.s_addr;
-	addr.sin_port = 0;
-	sendto(usocket, dummyPeekBuf64k, 0, MSG_NOSIGNAL, (struct sockaddr*)&addr, sizeof(addr));
-	// Update sport with the port assigned internal->lport = ntohs(local.sin_port)
-	socklen_t len = sizeof(addr);
-	if (getsockname(usocket, (struct sockaddr*)&addr, &len) == 0) {
-		uint16_t boundport = ntohs(addr.sin_port);
-		if (port + static_cast<int>(portOffset) >= 65536 || static_cast<int>(boundport) - static_cast<int>(portOffset) <= 0)
-			WARN_LOG(Log::sceNet, "sceNetAdhocPdpCreate - Wrapped Port Detected: Original(%d) -> Requested(%d), Bound(%d) -> BoundOriginal(%d)", port, requestedport, boundport, boundport - portOffset);
-		port = boundport - portOffset;
-	}
-
-	// Allocate Memory for Internal Data
-	AdhocSocket * internal = (AdhocSocket*)malloc(sizeof(AdhocSocket));
-
-	if (internal == NULL) {
-		DEBUG_LOG(Log::sceNet, "%s: out of memory when allocating internal socket tracking", __func__);
-		closesocket(usocket);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	// Find Free Translator Index
-	// FIXME: We should probably use an increasing index instead of looking for an empty slot from beginning if we want to simulate a real socket id
-	int i = 0;
-	i = FindFreeAdhocSocketSlot();
-
-	if (i >= MAX_SOCKET) {
-		DEBUG_LOG(Log::sceNet, "%s: out of slot when allocating internal socket tracking", __func__);
-		free(internal);
-		closesocket(usocket);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	// Clear Memory
-	memset(internal, 0, sizeof(AdhocSocket));
-
-	// Socket Type
-	internal->type = SOCK_PDP;
-	internal->nonblocking = flag;
-	internal->buffer_size = bufferSize;
-	internal->isClient = isClient;
-
-	// Fill in Data
-	internal->data.pdp.id = usocket;
-	internal->data.pdp.laddr = *saddr;
-	internal->data.pdp.lport = port; //getLocalPort(usocket) - portOffset;
-
-	// Link Socket to Translator ID
-	adhocSockets[i] = internal;
-
-	// Forward Port on Router
-	//sceNetPortOpen("UDP", port);
-	UPnP_Add(IP_PROTOCOL_UDP, isOriPort ? port : port + portOffset, port + portOffset); // g_PortManager.Add(IP_PROTOCOL_UDP, isOriPort ? port : port + portOffset, port + portOffset);
-
-	// Switch to non-blocking for futher usage
-	changeBlockingMode(usocket, 1);
-
-	// Success
-	INFO_LOG(Log::sceNet, "sceNetAdhocPdpCreate - PSP Socket id: %i, Host Socket id: %i", i + 1, usocket);
-	return i + 1;
+	return Transport().PdpCreate(saddr, port, bufferSize, flag, isClient, postoffice_enet_pdp_reliable);
 }
 
 /**
@@ -2849,20 +2016,8 @@ int sceNetAdhocPdpSend(MIPSState *mips, int id, const char *mac, u32 port, void 
 									//_acquireNetworkLock();
 
 									// Send Data. UDP are guaranteed to be sent as a whole or nothing(failed if len > SO_MAX_MSG_SIZE), and never be partially sent/recv
-									int sent = 0;
 									int error = 0;
-									if (serverHasRelay) {
-										sent = pdp_send_postoffice(id - 1, daddr, dport, data, len);
-										if (sent == 0) {
-											sent = len;
-										} else {
-											sent = SOCKET_ERROR;
-											error = EAGAIN;
-										}
-									} else {
-										sent = sendto(pdpsocket.id, (const char *)data, len, MSG_NOSIGNAL, (struct sockaddr*)&target, sizeof(target));
-										error = socket_errno;
-									}
+									int sent = Transport().PdpSendTo(id, daddr, dport, target, data, len, &error);
 
 									if (sent == SOCKET_ERROR) {
 										// Simulate blocking behaviour with non-blocking socket
@@ -2887,7 +2042,7 @@ int sceNetAdhocPdpSend(MIPSState *mips, int id, const char *mac, u32 port, void 
 									// Free Network Lock
 									//_freeNetworkLock();
 
-									hleEatMicro(50); // Can be longer than 1ms tho
+									hleEatMicro(21);
 									// Sent Data
 									if (sent >= 0) {
 										DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpSend[%i:%u]: Sent %u bytes to %s:%u\n", id, getLocalPort(pdpsocket.id), sent, ip2str(target.sin_addr).c_str(), ntohs(target.sin_port));
@@ -2963,20 +2118,8 @@ int sceNetAdhocPdpSend(MIPSState *mips, int id, const char *mac, u32 port, void 
 										target.sin_addr.s_addr = peer.ip;
 										target.sin_port = htons(dport + peer.portOffset);
 
-										int sent = 0;
 										int error = 0;
-										if (serverHasRelay) {
-											sent = pdp_send_postoffice(id - 1, &peer.mac, dport, data, len);
-											if (sent == 0) {
-												sent = len;
-											} else {
-												sent = SOCKET_ERROR;
-												error = EAGAIN;
-											}
-										} else {
-											sent = sendto(pdpsocket.id, (const char *)data, len, MSG_NOSIGNAL, (struct sockaddr*)&target, sizeof(target));
-											error = socket_errno;
-										}
+										int sent = Transport().PdpSendTo(id, &peer.mac, dport, target, data, len, &error);
 
 										if (sent == SOCKET_ERROR) {
 											DEBUG_LOG(Log::sceNet, "Socket Error (%i) on sceNetAdhocPdpSend[%i:%u->%u](BC) [size=%i]", error, id, getLocalPort(pdpsocket.id), ntohs(target.sin_port), len);
@@ -2994,7 +2137,7 @@ int sceNetAdhocPdpSend(MIPSState *mips, int id, const char *mac, u32 port, void 
 								// Free Network Lock
 								//_freeNetworkLock();
 
-								hleEatMicro(50);
+								hleEatMicro(10);
 								// Success, Broadcast never fails!
 								return 0; // len;
 							}
@@ -3115,171 +2258,7 @@ int sceNetAdhocPdpRecv(MIPSState *mips, int id, void *addr, void * port, void *b
 					return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_SOCKET_ALERTED, "socket alerted");
 				}
 
-				// Sender Address
-				struct sockaddr_in sin;
-				socklen_t sinlen;
-
-				// Acquire Network Lock
-				//_acquireNetworkLock();
-
-				SceNetEtherAddr mac;
-				int received = 0;
-				int error = 0;
-
-				if (serverHasRelay) {
-					while(1) {
-						int next_size = pdp_peek_next_size_postoffice(id - 1);
-						if (next_size == 0) {
-							// no next packet
-							received = SOCKET_ERROR;
-							error = EAGAIN;
-							break;
-						}
-						if (next_size > *len) {
-							// next is larger than current buffer
-							*len = next_size;
-							return SCE_NET_ADHOC_ERROR_NOT_ENOUGH_SPACE;
-						}
-						received = pdp_recv_postoffice(id - 1, saddr, sport, buf, len);
-						if (received == 0) {
-							// we got data
-							hleEatMicro(50);
-							return 0;
-						}
-						received = SOCKET_ERROR;
-						error = EAGAIN;
-						break;
-					}
-				} else {
-					int disCnt = 16;
-					while (--disCnt > 0)
-					{
-						// Receive Data. PDP always sent in full size or nothing(failed), recvfrom will always receive in full size as requested (blocking) or failed (non-blocking). If available UDP data is larger than buffer, excess data is lost.
-						// Should peek first for the available data size if it's more than len return SCE_NET_ADHOC_ERROR_NOT_ENOUGH_SPACE along with required size in len to prevent losing excess data
-						// On Windows: MSG_TRUNC are not supported on recvfrom (socket error WSAEOPNOTSUPP), so we use dummy buffer as an alternative
-						sinlen = sizeof(sin);
-						memset(&sin, 0, sinlen);
-						received = recvfrom(pdpsocket.id, dummyPeekBuf64k, dummyPeekBuf64kSize, MSG_PEEK | MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-						error = socket_errno;
-						// Discard packets from IP that can't be translated into MAC address to prevent confusing the game, since the sender MAC won't be updated and may contains invalid/undefined value.
-						// TODO: In order to discard packets from unresolvable IP (can't be translated into player's MAC) properly, we'll need to manage the socket buffer ourself,
-						//       by reading the whole available data, separates each datagram and discard unresolvable one, so we can calculate the correct number of available data to recv on GetPdpStat too.
-						//       We may also need to implement encryption (or a simple checksum will do) in order to validate the packet to findout whether it came from PPSSPP or a different App that may be sending/broadcasting data to the same port being used by a game
-						//       (in case the IP was resolvable but came from a different App, which will need to be discarded too)
-						// Note: Looping to check too many packets (ie. contiguous) to discard per one non-blocking PdpRecv syscall may cause a slow down
-						if (received != SOCKET_ERROR && !resolveIP(sin.sin_addr.s_addr, &mac)) {
-							// Remove the packet from socket buffer
-							sinlen = sizeof(sin);
-							memset(&sin, 0, sinlen);
-							recvfrom(pdpsocket.id, dummyPeekBuf64k, dummyPeekBuf64kSize, MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-							if (flag) {
-								VERBOSE_LOG(Log::sceNet, "%08x=sceNetAdhocPdpRecv: would block (disc)", SCE_NET_ADHOC_ERROR_WOULD_BLOCK); // Temporary fix to avoid a crash on the Logs due to trying to Logs syscall's argument from another thread (ie. AdhocMatchingInput thread)
-								return SCE_NET_ADHOC_ERROR_WOULD_BLOCK; // hleLogSuccessVerboseX(Log::sceNet, SCE_NET_ADHOC_ERROR_WOULD_BLOCK, "would block (disc)");
-							}
-							else {
-								// Simulate blocking behaviour with non-blocking socket, and discard more unresolvable packets until timeout reached
-								u64 threadSocketId = ((u64)__KernelGetCurThread()) << 32 | pdpsocket.id;
-								return WaitBlockingAdhocSocket(threadSocketId, PDP_RECV, id, buf, len, timeout, saddr, sport, "pdp recv (disc)");
-							}
-						}
-						else
-							break;
-					}
-				}
-
-				// At this point we assumed that the packet is a valid PPSSPP packet
-				if (received != SOCKET_ERROR && *len < received) {
-					INFO_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Peeked %u/%u bytes from %s:%u\n", id, getLocalPort(pdpsocket.id), received, *len, ip2str(sin.sin_addr).c_str(), ntohs(sin.sin_port));
-
-					// A datagram larger than the buffer stays queued, and isn't copied (pspautotests net/adhoc/pdp).
-					// Return the actual available data size
-					*len = received;
-
-					// Provide Sender Information
-					*saddr = mac;
-					*sport = ntohs(sin.sin_port) - portOffset;
-
-					// Update last recv timestamp, may cause disconnection not detected properly tho
-					peerlock.lock();
-					auto peer = findFriend(&mac);
-					if (peer != NULL) peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
-					peerlock.unlock();
-
-					return hleLogVerbose(Log::sceNet, SCE_NET_ADHOC_ERROR_NOT_ENOUGH_SPACE, "not enough space");
-				}
-
-				if (!serverHasRelay) {
-					sinlen = sizeof(sin);
-					memset(&sin, 0, sinlen);
-					// On Windows: Socket Error 10014 may happen when buffer size is less than the minimum allowed/required (ie. negative number on Vulcanus Seek and Destroy), the address is not a valid part of the user address space (ie. on the stack or when buffer overflow occurred), or the address is not properly aligned (ie. multiple of 4 on 32bit and multiple of 8 on 64bit) https://stackoverflow.com/questions/861154/winsock-error-code-10014
-					received = recvfrom(pdpsocket.id, (char*)buf, std::max(0, *len), MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-					error = socket_errno;
-				}
-
-				// On Windows: recvfrom on UDP can get error WSAECONNRESET when previous sendto's destination is unreachable (or destination port is not bound), may need to disable SIO_UDP_CONNRESET
-				if (received == SOCKET_ERROR && (error == EAGAIN || error == EWOULDBLOCK || error == ECONNRESET)) {
-					if (flag == 0) {
-						// Simulate blocking behaviour with non-blocking socket
-						u64 threadSocketId = ((u64)__KernelGetCurThread()) << 32 | pdpsocket.id;
-						return WaitBlockingAdhocSocket(threadSocketId, PDP_RECV, id, buf, len, timeout, saddr, sport, "pdp recv");
-					}
-
-					VERBOSE_LOG(Log::sceNet, "%08x=sceNetAdhocPdpRecv: would block", SCE_NET_ADHOC_ERROR_WOULD_BLOCK); // Temporary fix to avoid a crash on the Logs due to trying to Logs syscall's argument from another thread (ie. AdhocMatchingInput thread)
-					return SCE_NET_ADHOC_ERROR_WOULD_BLOCK; // hleLogSuccessVerboseX(Log::sceNet, SCE_NET_ADHOC_ERROR_WOULD_BLOCK, "would block");
-				}
-
-				hleEatMicro(50);
-				// Received Data. UDP can also receives 0 data, while on TCP 0 data = connection gracefully closed, but not sure about PDP tho
-				if (received >= 0) {
-					DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Received %u bytes from %s:%u\n", id, getLocalPort(pdpsocket.id), received, ip2str(sin.sin_addr).c_str(), ntohs(sin.sin_port));
-
-					// Find Peer MAC
-					if (resolveIP(sin.sin_addr.s_addr, &mac)) {
-						// Provide Sender Information
-						*saddr = mac;
-						*sport = ntohs(sin.sin_port) - portOffset;
-
-						// Save Length
-						*len = received; // The PSP writes the received length back (pspautotests net/adhoc/pdp).
-
-						// Update last recv timestamp, may cause disconnection not detected properly tho
-						peerlock.lock();
-						auto peer = findFriend(&mac);
-						if (peer != NULL) peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
-						peerlock.unlock();
-
-						// Free Network Lock
-						//_freeNetworkLock();
-
-						// Return Success. According to pspsdk-1.0+beta2 returned value is Number of bytes received, but JPCSP returning 0?
-						return 0; // 0, not the length, as on the PSP (pspautotests net/adhoc/pdp). KH BBS can't see rooms otherwise.
-					}
-
-					// Free Network Lock
-					//_freeNetworkLock();
-
-					//free(tmpbuf);
-
-					// Receiving data from unknown peer? Should never reached here! Unless the Peeked's packet was different than the Recved one (which mean there is a problem)
-					WARN_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Received %i bytes from Unknown Peer %s:%u", id, getLocalPort(pdpsocket.id), received, ip2str(sin.sin_addr).c_str(), ntohs(sin.sin_port));
-					if (flag) {
-						VERBOSE_LOG(Log::sceNet, "%08x=sceNetAdhocPdpRecv: would block (problem)", SCE_NET_ADHOC_ERROR_WOULD_BLOCK); // Temporary fix to avoid a crash on the Logs due to trying to Logs syscall's argument from another thread (ie. AdhocMatchingInput thread)
-						return SCE_NET_ADHOC_ERROR_WOULD_BLOCK; // hleLogSuccessVerboseX(Log::sceNet, SCE_NET_ADHOC_ERROR_WOULD_BLOCK, "would block (problem)");
-					}
-				}
-
-				// Free Network Lock
-				//_freeNetworkLock();
-
-#ifdef PDP_DIRTY_MAGIC
-				// Restore Nonblocking Flag for Return Value
-				if (wouldblock) flag = 1;
-#endif
-
-				DEBUG_LOG(Log::sceNet, "sceNetAdhocPdpRecv[%i:%u]: Result:%i (Error:%i)", id, pdpsocket.lport, received, error);
-
-				// Unexpected error (other than EAGAIN/EWOULDBLOCK/ECONNRESET) or in case the Peeked's packet was different than Recved one, treated as Timeout?
-				return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_TIMEOUT, "timeout?");
+				return Transport().PdpRecv(id, saddr, sport, buf, len, timeout, flag);
 			}
 
 			// Invalid Argument
@@ -3315,178 +2294,49 @@ int sceNetAdhocSetSocketAlert(MIPSState *mips, int id, int flag) {
 	return hleDelayResult(hleLogDebug(Log::sceNet, retval), "set socket alert delay", 1000);
 }
 
-static bool postoffice_can_recv_or_listen_has_request(int idx) {
-	AdhocSocket *internal = adhocSockets[idx];
-	if (internal->type == SOCK_PTP) {
-		if (internal->data.ptp.state == ADHOC_PTP_STATE_LISTEN) {
-			void *ptp_listen_handle = ptp_listen_postoffice_recover(idx);
-			if (ptp_listen_handle == NULL) {
-				return false;
-			}
-			int has_request = ptp_listen_has_request(ptp_listen_handle);
-			if (has_request == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-				internal->postofficeHandle = NULL;
-				ptp_listen_close(ptp_listen_handle);
-				return false;
-			}
-			if (has_request) {
-				return true;
-			}
-		} else if (internal->data.ptp.state == ADHOC_PTP_STATE_ESTABLISHED) {
-			void *ptp_handle = internal->postofficeHandle;
-			if (ptp_handle == NULL) {
-				return false;
-			}
-			int peek_len = ptp_peek_next_size(ptp_handle);
-			if (peek_len == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-				return false;
-			}
-			if (peek_len > 0) {
-				return true;
-			}
-		}
-	} else {
-		void *pdp_handle = pdp_postoffice_recover(idx);
-		if (pdp_handle == NULL) {
-			return false;
-		}
-		int peek_len = pdp_buffered_data_size(pdp_handle);
-		if (peek_len == AEMU_POSTOFFICE_CLIENT_SESSION_DEAD) {
-			internal->postofficeHandle = NULL;
-			pdp_delete(pdp_handle);
-			return false;
-		}
-		if (peek_len > 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool postoffice_can_send(int idx) {
-	AdhocSocket *internal = adhocSockets[idx];
-	if (internal->type == SOCK_PTP && internal->data.ptp.state == ADHOC_PTP_STATE_ESTABLISHED) {
-		void *ptp_handle = internal->postofficeHandle;
-		if (ptp_handle == NULL) {
-			return false;
-		}
-		if (ptp_is_dead(ptp_handle)) {
-			return false;
-		}
-		return ptp_send_buf_not_full(ptp_handle);
-	} else {
-		void *pdp_handle = pdp_postoffice_recover(idx);
-		if (pdp_handle == NULL) {
-			return false;
-		}
-		if (pdp_is_dead(pdp_handle)) {
-			internal->postofficeHandle = NULL;
-			pdp_delete(pdp_handle);
-			return false;
-		}
-		return pdp_send_buf_not_full(pdp_handle);
-	}
-	return false;
-}
-
 int PollAdhocSocket(SceNetAdhocPollSd* sds, int count, int timeout, int nonblock) {
-	//WSAPoll only available for Vista or newer, so we'll use an alternative way for XP since Windows doesn't have poll function like *NIX
-	fd_set readfds, writefds, exceptfds;
-	int fd;
-	int maxfd = 0;
-	FD_ZERO(&readfds); FD_ZERO(&writefds); FD_ZERO(&exceptfds);
-
 	for (int i = 0; i < count; i++) {
 		sds[i].revents = 0;
-		// Fill in Socket ID
-		if (sds[i].id > 0 && sds[i].id <= MAX_SOCKET && adhocSockets[sds[i].id - 1] != NULL) {
-			auto sock = adhocSockets[sds[i].id - 1];
-			if (!sock) {
-				return SCE_NET_ADHOC_ERROR_SOCKET_DELETED;
-			}
-
-			if (serverHasRelay) {
-				continue;
-			} else {
-				if (sock->type == SOCK_PTP) {
-					fd = sock->data.ptp.id;
-				}
-				else {
-					fd = sock->data.pdp.id;
-				}
-			}
-
-			if (fd > maxfd) maxfd = fd;
-			FD_SET(fd, &readfds);
-			FD_SET(fd, &writefds);
-			FD_SET(fd, &exceptfds);
-		}
 	}
-	timeval tmout;
-	tmout.tv_sec = timeout / 1000000; // seconds
-	tmout.tv_usec = (timeout % 1000000); // microseconds
-	int affectedsockets = 0;
+	std::vector<AdhocPollState> states(std::max(count, 0));
+	int affectedsockets = Transport().PollWait(sds, count, timeout, states.data());
 	// A disconnected socket makes the call return EXCEPTION_EVENT, whatever else is ready.
 	bool disconnected = false;
-	if (!serverHasRelay)
-		affectedsockets = select(maxfd + 1, &readfds, &writefds, &exceptfds, &tmout);
 	if (affectedsockets >= 0) {
 		affectedsockets = 0;
 		for (int i = 0; i < count; i++) {
 			if (sds[i].id > 0 && sds[i].id <= MAX_SOCKET && adhocSockets[sds[i].id - 1] != NULL) {
 				auto sock = adhocSockets[sds[i].id - 1];
+				const AdhocPollState &state = states[i];
 
-				if (!serverHasRelay) {
-					if (sock->type == SOCK_PTP) {
-						fd = sock->data.ptp.id;
-					}
-					else {
-						fd = sock->data.pdp.id;
-					}
-				}
-				if (serverHasRelay) {
-					if ((sds[i].events & ADHOC_EV_RECV) && postoffice_can_recv_or_listen_has_request(sds[i].id - 1))
-						sds[i].revents |= ADHOC_EV_RECV;
-					if ((sds[i].events & ADHOC_EV_SEND) && postoffice_can_send(sds[i].id - 1))
-						sds[i].revents |= ADHOC_EV_SEND;
-				} else {
-					if ((sds[i].events & ADHOC_EV_RECV) && FD_ISSET(fd, &readfds))
-						sds[i].revents |= ADHOC_EV_RECV;
-					if ((sds[i].events & ADHOC_EV_SEND) && FD_ISSET(fd, &writefds))
-						sds[i].revents |= ADHOC_EV_SEND;
-					if (sock->alerted_flags)
-						sds[i].revents |= ADHOC_EV_ALERT;
-				}
+				if ((sds[i].events & ADHOC_EV_RECV) && state.readable)
+					sds[i].revents |= ADHOC_EV_RECV;
+				if ((sds[i].events & ADHOC_EV_SEND) && state.writable)
+					sds[i].revents |= ADHOC_EV_SEND;
+				if (state.alerted)
+					sds[i].revents |= ADHOC_EV_ALERT;
 				// Mask certain revents bits with events bits
 				sds[i].revents &= sds[i].events;
 
 				// What listening and connected PTP sockets report on a PSP (pspautotests net/adhoc/poll):
 				// SEND and FLUSH always, CONNECT once connected, and ACCEPT or RECV when there's something
 				// to take. A connection whose peer has closed reports DISCONNECT alone.
-				const bool readable = serverHasRelay ? postoffice_can_recv_or_listen_has_request(sds[i].id - 1) : FD_ISSET(fd, &readfds);
-				// A connection PtpOpen started may have come up since anything looked at it.
-				if (sock->type == SOCK_PTP && sock->data.ptp.state == ADHOC_PTP_STATE_SYN_SENT && !serverHasRelay && FD_ISSET(fd, &writefds)) {
-					struct sockaddr_in peer;
-					socklen_t peerLen = sizeof(peer);
-					if (getpeername(fd, (struct sockaddr *)&peer, &peerLen) == 0) {
-						ptpSetEstablished(sock);
-					}
+				const bool readable = state.readable;
+				if (sock->type == SOCK_PTP && sock->data.ptp.state == ADHOC_PTP_STATE_SYN_SENT) {
+					Transport().PollCheckConnecting(sds[i].id, sock, state);
 				}
 				if (sock->type == SOCK_PTP && sock->data.ptp.state == ADHOC_PTP_STATE_LISTEN) {
 					sds[i].revents = (ADHOC_EV_SEND | ADHOC_EV_FLUSH | (readable ? ADHOC_EV_ACCEPT : 0)) & sds[i].events;
 				} else if (sock->type == SOCK_PTP && sock->data.ptp.state == ADHOC_PTP_STATE_ESTABLISHED) {
-					char peek;
-					if (!serverHasRelay && readable && recv(fd, &peek, 1, MSG_PEEK | MSG_NOSIGNAL) == 0) {
+					if (readable && Transport().PtpPeerClosed(sock)) {
 						sds[i].revents = ADHOC_EV_DISCONNECT;
 						disconnected = true;
 					} else {
 						sds[i].revents = (ADHOC_EV_SEND | ADHOC_EV_CONNECT | ADHOC_EV_FLUSH | (readable ? ADHOC_EV_RECV : 0)) & sds[i].events;
 					}
 				} else if (sock->type == SOCK_PTP) {
-					// Fate Unlimited Codes and Carnage Heart EXA relies on AdhocPollSocket in order to retry a failed PtpConnect, but the interval must not be too long (about 1 frame before state became Established by GetPtpStat) for Bleach Heat the Soul 7 to work properly.
-					if ((sds[i].events & ADHOC_EV_CONNECT) && ((sock->data.ptp.state == ADHOC_PTP_STATE_CLOSED && sock->attemptCount == 0) ||
-						(sock->data.ptp.state == ADHOC_PTP_STATE_SYN_SENT && (static_cast<s64>(CoreTiming::GetGlobalTimeUsScaled() - sock->lastAttempt) > 1000/*std::max(1000, sock->retry_interval - 60000)*/)))) {
-
+					ptpUpdateConnecting(sock);
+					if ((sds[i].events & ADHOC_EV_CONNECT) && sock->data.ptp.state == ADHOC_PTP_STATE_ESTABLISHED) {
 						sds[i].revents |= ADHOC_EV_CONNECT;
 					}
 					// Check for socket state (already disconnected/closed by remote peer, already closed/deleted, not a socket or not opened/connected yet?)
@@ -3593,8 +2443,7 @@ int sceNetAdhocPollSocket(MIPSState *mips, u32 socketStructAddr, int count, int 
 						}
 					}
 				}
-				// Workaround to get 30 FPS instead of the too fast 60 FPS on Fate Unlimited Codes, it's abit absurd for a non-blocking call to have this much delay tho, and hleDelayResult doesn't works as good as hleEatMicro for this workaround.
-				hleEatMicro(50); // hleEatMicro(7500); // normally 1ms, but using 7.5ms here seems to show better result for Bleach Heat the Soul 7 and other games with too high FPS, but may have a risk of slowing down games that already runs at normal FPS? (need more games to test this)
+				hleEatMicro(18);
 				return hleLogDebug(Log::sceNet, affectedsockets, "success");
 			}
 			//else if (nonblock && affectedsockets < 0)
@@ -3611,17 +2460,6 @@ int sceNetAdhocPollSocket(MIPSState *mips, u32 socketStructAddr, int count, int 
 	return hleLogDebug(Log::sceNet, SCE_NET_ADHOC_ERROR_NOT_INITIALIZED, "adhoc not initialized");
 }
 
-static int pdp_delete_postoffice(int idx) {
-	AdhocSocket *internal = adhocSockets[idx];
-	if (internal->postofficeHandle != NULL) {
-		pdp_delete(internal->postofficeHandle);
-	}
-	adhocSockets[idx] = NULL;
-	free(internal);
-	INFO_LOG(Log::sceNet, "%s: closed pdp socket with id %d", __func__, idx + 1);
-	return 0;
-}
-
 int NetAdhocPdp_Delete(int id, int unknown) {
 	// Library is initialized
 	if (netAdhocInited) {
@@ -3632,25 +2470,7 @@ int NetAdhocPdp_Delete(int id, int unknown) {
 
 			// Valid Socket
 			if (sock != NULL && sock->type == SOCK_PDP) {
-				if (serverHasRelay)
-					return pdp_delete_postoffice(id - 1);
-
-				// Close Connection
-				shutdown(sock->data.pdp.id, SD_RECEIVE);
-				closesocket(sock->data.pdp.id);
-
-				// Remove Port Forward from Router
-				//sceNetPortClose("UDP", sock->lport);
-				//g_PortManager.Remove(IP_PROTOCOL_UDP, isOriPort ? sock->lport : sock->lport + portOffset); // Let's not remove mapping in real-time as it could cause lags/disconnection when joining a room with slow routers
-
-				// Free Memory
-				free(sock);
-
-				// Free Translation Slot
-				adhocSockets[id - 1] = NULL;
-
-				// Success
-				return 0;
+				return Transport().PdpDelete(id);
 			}
 
 			// Invalid Socket ID
@@ -3849,7 +2669,7 @@ int sceNetAdhocctlGetScanInfo(MIPSState *mips, u32 sizeAddr, u32 bufAddr) {
 			// Multithreading Unlock
 			peerlock.unlock();
 
-			hleEatMicro(200);
+			hleEatMicro(2);
 			// Return Success
 			return hleLogDebug(Log::sceNet, 0);
 		}
@@ -3899,15 +2719,23 @@ static u32 sceNetAdhocctlAddHandler(u32 handlerPtr, u32 handlerArg) {
 	return hleNoLog(retval);
 }
 
-u32 NetAdhocctl_Disconnect() {
+static u32 NetAdhocctl_Disconnect(bool fromGameMode = false) {
 	// Library initialized
 	if (netAdhocctlInited) {
 		int iResult, error;
 		if (isAdhocctlBusy && CoreTiming::IsScheduled(adhocctlNotifyEvent)) {
 			return SCE_NET_ADHOCCTL_ERROR_BUSY;
 		}
-		// Returns at once on a PSP, and DISCONNECT follows after about 105 ms (pspautotests net/adhoc/timing).
+		// Until a Create or Connect has connected, it's BUSY, and the join goes on (pspautotests
+		// net/adhoc/abandon).
+		if (isAdhocctlBusy && adhocctlState == ADHOCCTL_STATE_DISCONNECTED && adhocctlCurrentMode != ADHOCCTL_MODE_NONE) {
+			return SCE_NET_ADHOCCTL_ERROR_BUSY;
+		}
+		// Returns at once on a PSP, and DISCONNECT follows after about 105 ms (pspautotests net/adhoc/timing),
+		// or 650 ms after ExitGameMode (net/adhoc/pair/gamemodetiming).
 		adhocctlRequestTimeUs = CoreTiming::GetGlobalTimeUs();
+		adhocctlDisconnectFromGameMode = fromGameMode;
+		AbandonGroupJoin();
 
 		// Connected State (Adhoc Mode). Attempting to leave a group while not in a group will be kicked out by Adhoc Server (ie. some games tries to disconnect more than once within a short time)
 		if (adhocctlState != ADHOCCTL_STATE_DISCONNECTED || adhocctlInServerGroup) {
@@ -4059,7 +2887,7 @@ int sceNetAdhocctlTerm() {
 	//if (netAdhocMatchingInited) NetAdhocMatching_Term();
 	int retval = NetAdhocctl_Term();
 
-	hleEatMicro(adhocDefaultDelay);
+	hleEatMicro(154);
 	return hleLogInfo(Log::sceNet, retval);
 }
 
@@ -4365,6 +3193,7 @@ int NetAdhocctl_CreateEnterGameMode(const char* group_name, int game_type, int n
 	adhocConnectionType = ADHOC_CREATE;
 	netAdhocGameModeEntered = true;
 	netAdhocEnterGameModeTimeout = timeout;
+	gameModeEnterTimeUs = CoreTiming::GetGlobalTimeUs();
 	return NetAdhocctl_Create(group_name);
 }
 
@@ -4427,6 +3256,7 @@ static int sceNetAdhocctlJoinEnterGameMode(MIPSState *mips, const char * group_n
 	adhocConnectionType = ADHOC_JOIN;
 	netAdhocGameModeEntered = true;
 	netAdhocEnterGameModeTimeout = timeout;
+	gameModeEnterTimeUs = CoreTiming::GetGlobalTimeUs();
 	return hleLogDebug(Log::sceNet, NetAdhocctl_Create(group_name));
 }
 
@@ -4453,10 +3283,9 @@ int sceNetAdhocctlCreateEnterGameModeMin(MIPSState *mips, const char *group_name
 	return hleLogDebug(Log::sceNet, NetAdhocctl_CreateEnterGameMode(group_name, game_type, num_members, membersAddr, timeout, flag));
 }
 
+// Leaves adhocctl, the group and matching running: a PSP stays in its group through sceNetAdhocTerm
+// and sceNetAdhocInit (pspautotests net/adhoc/term). The other callers terminate adhocctl first.
 int NetAdhoc_Term() {
-	// Since Adhocctl & AdhocMatching uses Sockets & Threads we should terminate them also to release their resources
-	NetAdhocctl_Term();
-
 	// Library is initialized
 	if (netAdhocInited) {
 		// Delete GameMode Buffers
@@ -4464,6 +3293,7 @@ int NetAdhoc_Term() {
 
 		// Delete Adhoc Sockets
 		deleteAllAdhocSockets();
+		nextAdhocSocketSlot = 0;
 
 		// Terminate Internet Library
 		//sceNetInetTerm();
@@ -4497,7 +3327,7 @@ int sceNetAdhocTerm() {
 	// WLAN might be disabled in the middle of successfull multiplayer, but we still need to cleanup all the sockets right?
 	int retval = NetAdhoc_Term();
 
-	hleEatMicro(adhocDefaultDelay);
+	hleEatMicro(10);
 	return hleLogInfo(Log::sceNet, retval);
 }
 
@@ -4545,26 +3375,7 @@ static int sceNetAdhocGetPdpStat(MIPSState *mips, u32 structSize, u32 structAddr
 					// Set available bytes to be received. With FIONREAD There might be ghosting 1 byte in recv buffer when remote peer's socket got closed (ie. Warriors Orochi 2) Attempting to recv this ghost 1 byte will result to socket error 10054 (may need to disable SIO_UDP_CONNRESET error)
 					// It seems real PSP respecting the socket buffer size arg, so we may need to cap the value up to the buffer size arg since we use larger buffer, for PDP/UDP the total size must not contains partial/truncated message to avoid data loss.
 					// TODO: We may need to manage PDP messages ourself by reading each msg 1-by-1 and moving it to our internal buffer(msg array) in order to calculate the correct messages size that can fit into buffer size when there are more than 1 messages in the recv buffer (simulate FIONREAD)
-					if (serverHasRelay) {
-						void *postofficeHandle = pdp_postoffice_recover(j);
-						if (postofficeHandle != NULL) {
-							sock->data.pdp.rcv_sb_cc = pdp_buffered_data_size(postofficeHandle);
-						}
-					} else {
-						sock->data.pdp.rcv_sb_cc = getAvailToRecv(sock->data.pdp.id, sock->buffer_size);
-						// There might be a possibility for the data to be taken by the OS, thus FIONREAD returns 0, but can be Received
-						if (sock->data.pdp.rcv_sb_cc == 0) {
-							// Let's try to peek the data size
-							// TODO: May need to filter out packets from an IP that can't be translated to MAC address
-							struct sockaddr_in sin;
-							socklen_t sinlen;
-							sinlen = sizeof(sin);
-							memset(&sin, 0, sinlen);
-							int received = recvfrom(sock->data.pdp.id, dummyPeekBuf64k, std::min((u32)dummyPeekBuf64kSize, sock->buffer_size), MSG_PEEK | MSG_NOSIGNAL, (struct sockaddr*)&sin, &sinlen);
-							if (received > 0)
-								sock->data.pdp.rcv_sb_cc = received;
-						}
-					}
+					Transport().PdpUpdateRecvStat(j + 1, sock);
 
 					// Copy Socket Data from Internal Memory
 					memcpy(&buf[i], &sock->data.pdp, sizeof(SceNetAdhocPdpStat));
@@ -4589,7 +3400,7 @@ static int sceNetAdhocGetPdpStat(MIPSState *mips, u32 structSize, u32 structAddr
 			// Update Buffer Length
 			*buflen = i * sizeof(SceNetAdhocPdpStat);
 
-			hleEatMicro(50); // Not sure how long it supposed to take
+			hleEatMicro(1);
 			// Success
 			return 0;
 		}
@@ -4609,6 +3420,7 @@ static int sceNetAdhocGetPdpStat(MIPSState *mips, u32 structSize, u32 structAddr
  * @param buf PTP Socket List Buffer (can be NULL if you wish to receive Required Length)
  * @return 0 on success or... ADHOC_INVALID_ARG, ADHOC_NOT_INITIALIZED
  */
+
 static int sceNetAdhocGetPtpStat(MIPSState *mips, u32 structSize, u32 structAddr) {
 	// Spams a lot
 	VERBOSE_LOG(Log::sceNet,"sceNetAdhocGetPtpStat(%08x, %08x) at %08x",structSize,structAddr,mips->pc);
@@ -4647,47 +3459,9 @@ static int sceNetAdhocGetPtpStat(MIPSState *mips, u32 structSize, u32 structAddr
 				// Valid Socket Entry
 				auto sock = adhocSockets[j];
 				if ( sock != NULL && sock->type == SOCK_PTP) {
-					// Update connection state.
-					// GvG Next Plus relies on GetPtpStat to determine if Connection has been Established or not, but should not be updated too long for GvG to work, and should not be updated too fast(need to be 1 frame after PollSocket checking for ADHOC_EV_CONNECT) for Bleach Heat the Soul 7 to work properly.
-					if ((sock->data.ptp.state == ADHOC_PTP_STATE_SYN_SENT || sock->data.ptp.state == ADHOC_PTP_STATE_SYN_RCVD) && (static_cast<s64>(CoreTiming::GetGlobalTimeUsScaled() - sock->lastAttempt) > 33333/*sock->retry_interval*/)) {
-						// FIXME: May be we should poll all of them together on a single poll call instead of each socket separately?
-						if (serverHasRelay) {
-							if (sock->postofficeHandle != NULL) {
-								// good to go
-								ptpSetEstablished(sock);
-							}
-						} else {
-							if (IsSocketReady(sock->data.ptp.id, true, true) > 0) {
-								struct sockaddr_in sin;
-								socklen_t sinlen = sizeof(sin);
-								memset(&sin, 0, sinlen);
-								// Ensure that the connection really established or not, since "select" alone can't accurately detects it
-								if (getpeername(sock->data.ptp.id, (struct sockaddr*)&sin, &sinlen) != SOCKET_ERROR) {
-									ptpSetEstablished(sock);
-								}
-							}
-						}
-					}
+					ptpUpdateConnecting(sock);
 
-					if (serverHasRelay) {
-						if (sock->postofficeHandle != NULL) {
-							sock->data.ptp.rcv_sb_cc = ptp_peek_next_size(sock->postofficeHandle);
-						} else {
-							sock->data.ptp.rcv_sb_cc = 0;
-						}
-					}else{
-						// Set available bytes to be received
-						sock->data.ptp.rcv_sb_cc = getAvailToRecv(sock->data.ptp.id);
-						// It seems real PSP respecting the socket buffer size arg, so we may need to cap the value to the buffer size arg since we use larger buffer
-						sock->data.ptp.rcv_sb_cc = std::min(sock->data.ptp.rcv_sb_cc, (u32_le)sock->buffer_size);
-						// There might be a possibility for the data to be taken by the OS, thus FIONREAD returns 0, but can be Received
-						if (sock->data.ptp.rcv_sb_cc == 0) {
-							// Let's try to peek the data size
-							int received = recv(sock->data.ptp.id, dummyPeekBuf64k, std::min((u32)dummyPeekBuf64kSize, sock->buffer_size), MSG_PEEK | MSG_NOSIGNAL);
-							if (received > 0)
-								sock->data.ptp.rcv_sb_cc = received;
-						}
-					}
+					Transport().PtpUpdateRecvStat(sock);
 
 					// Copy Socket Data from internal Memory
 					memcpy(&buf[i], &sock->data.ptp, sizeof(SceNetAdhocPtpStat));
@@ -4712,7 +3486,7 @@ static int sceNetAdhocGetPtpStat(MIPSState *mips, u32 structSize, u32 structAddr
 			// Update Buffer Length
 			*buflen = i * sizeof(SceNetAdhocPtpStat);
 
-			hleEatMicro(50); // Not sure how long it takes, since GetPtpStat didn't get logged when using prx files on JPCSP
+			hleEatMicro(2);
 			// Success
 			return 0;
 		}
@@ -4816,7 +3590,7 @@ int RecreatePtpSocket(int ptpId) {
 	return 0;
 }
 
-static uint16_t get_random_unused_ptp_port() {
+uint16_t get_random_unused_ptp_port() {
 	uint16_t test_port = rand() % 65534 + 1;
 	auto port_in_use = [&test_port] {
 		for (int i = 0; i < MAX_SOCKET; i++) {
@@ -4837,56 +3611,6 @@ static uint16_t get_random_unused_ptp_port() {
 	return test_port;
 }
 
-static int ptp_open_postoffice(const SceNetEtherAddr *saddr, uint16_t sport, const SceNetEtherAddr *daddr, uint16_t dport, uint32_t bufsize, uint32_t rexmt_int, int rexmt_cnt) {
-	AdhocSocket *internal = (AdhocSocket *)malloc(sizeof(AdhocSocket));
-	if (internal == NULL) {
-		ERROR_LOG(Log::sceNet, "%s: ran out of heap memory trying to open ptp socket", __func__);
-		return ERROR_NET_NO_SPACE;
-	}
-	memset(internal, 0, sizeof(AdhocSocket));
-	internal->retry_interval = rexmt_int;
-	internal->retry_count = rexmt_cnt;
-
-	internal->type = SOCK_PTP;
-	internal->postofficeHandle = NULL;
-	internal->data.ptp.state = ADHOC_PTP_STATE_CLOSED;
-	internal->data.ptp.laddr = *saddr;
-	internal->data.ptp.lport = sport == 0 ? get_random_unused_ptp_port() : sport;
-	internal->data.ptp.paddr = *daddr;
-	internal->data.ptp.pport = dport;
-	internal->data.ptp.rcv_sb_cc = bufsize;
-	internal->data.ptp.snd_sb_cc = 0;
-	internal->flags = 0;
-	internal->connectThread = NULL;
-	internal->connectThreadDone = true;
-	internal->lastAttempt = 0;
-	internal->internalLastAttempt = 0;
-
-	AdhocSocket **slot = NULL;
-	int i;
-	i = FindFreeAdhocSocketSlot();
-	if (i < MAX_SOCKET) {
-		slot = &adhocSockets[i];
-	}
-
-	if (slot == NULL) {
-		free(internal);
-		ERROR_LOG(Log::sceNet, "%s: cannot find free socket mapper slot while opening ptp socket", __func__);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	internal->data.ptp.id = AEMU_POSTOFFICE_ID_BASE + i;
-
-	*slot = internal;
-	INFO_LOG(Log::sceNet, "%s: created ptp socket with id %d", __func__, i + 1);
-
-	// PtpOpen starts connecting by itself: on the PSP the client is ESTABLISHED right after it (pspautotests
-	// net/adhoc/ptp). The Warriors sends without calling PtpConnect.
-	NetAdhocPtp_Connect(i + 1, 0, 1, false);
-
-	return i + 1;
-}
-
 /**
  * Adhoc Emulator PTP Active Socket Creator
  * @param saddr Local MAC (Unused)
@@ -4899,6 +3623,7 @@ static int ptp_open_postoffice(const SceNetEtherAddr *saddr, uint16_t sport, con
  * @param flag Bitflags (Unused)
  * @return Socket ID > 0 on success or... ADHOC_NOT_INITIALIZED, ADHOC_INVALID_ARG, ADHOC_INVALID_ADDR, ADHOC_INVALID_PORT
  */
+
 static int sceNetAdhocPtpOpen(MIPSState *mips, const char *srcmac, int sport, const char *dstmac, int dport, int bufsize, int rexmt_int, int rexmt_cnt, int flag) {
 	INFO_LOG(Log::sceNet, "sceNetAdhocPtpOpen(%s, %d, %s, %d, %d, %d, %d, %d) at %08x", mac2str((SceNetEtherAddr*)srcmac).c_str(), sport, mac2str((SceNetEtherAddr*)dstmac).c_str(),dport,bufsize, rexmt_int, rexmt_cnt, flag, mips->pc);
 	if (!g_Config.bEnableWlan) {
@@ -4906,7 +3631,6 @@ static int sceNetAdhocPtpOpen(MIPSState *mips, const char *srcmac, int sport, co
 	}
 	SceNetEtherAddr* saddr = (SceNetEtherAddr*)srcmac;
 	SceNetEtherAddr* daddr = (SceNetEtherAddr*)dstmac;
-	bool isClient = false;
 
 	// pspautotests net/adhoc/ptp. Zero sizes and retransmit settings are accepted.
 	if (saddr == NULL || daddr == NULL || flag != 0) {
@@ -4930,9 +3654,12 @@ static int sceNetAdhocPtpOpen(MIPSState *mips, const char *srcmac, int sport, co
 
 	// Library is initialized
 	if (netAdhocInited) {
-		// Some games (ie. DBZ Shin Budokai 2) might be getting the saddr/srcmac content from SaveState and causing problems if current MAC is different :( So we try to fix it here
+		// Some games (ie. DBZ Shin Budokai 2) might be getting the saddr/srcmac content from SaveState and causing problems if
+		// current MAC is different :( So we use the local MAC instead, without writing it into the game's memory.
+		SceNetEtherAddr localSrcMac;
 		if (saddr != NULL) {
-			getLocalMac(saddr);
+			getLocalMac(&localSrcMac);
+			saddr = &localSrcMac;
 		}
 		// Valid Addresses. FIXME: MAC only valid after successful attempt to Create/Connect/Join a Group? (ie. adhocctlCurrentMode != ADHOCCTL_MODE_NONE)
 		// The broadcast address is accepted, as on a PSP (pspautotests net/adhoc/ptp); connecting to it just never succeeds.
@@ -4943,150 +3670,9 @@ static int sceNetAdhocPtpOpen(MIPSState *mips, const char *srcmac, int sport, co
 				return hleLogDebug(Log::sceNet, SCE_NET_ADHOC_ERROR_PORT_IN_USE, "port in use");
 			}
 
-			// Random Port required
-			if (sport == 0 && !serverHasRelay) {
-				isClient = true;
-				//sport 0 should be shifted back to 0 when using offset Phantasy Star Portable 2 use this
-				sport = -static_cast<int>(portOffset);
-			}
-
 			// Valid Arguments
 			if (bufsize > 0 && rexmt_int >= 0 && rexmt_cnt >= 0) {
-				if (serverHasRelay)
-					return ptp_open_postoffice(saddr, sport, daddr, dport, bufsize, rexmt_int, rexmt_cnt);
-
-				// Create Infrastructure Socket (?)
-				// Socket is remapped through adhocSockets
-				int tcpsocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-				// Valid Socket produced
-				if (tcpsocket > 0) {
-					// Change socket MSS
-					setSockMSS(tcpsocket, PSP_ADHOC_PTP_MSS);
-
-					// Change socket buffer size to be consistent on all platforms.
-					setSockBufferSize(tcpsocket, SO_SNDBUF, bufsize*5); //PSP_ADHOC_PTP_MSS
-					setSockBufferSize(tcpsocket, SO_RCVBUF, bufsize*10); //PSP_ADHOC_PTP_MSS*10
-
-					// Enable KeepAlive
-					setSockKeepAlive(tcpsocket, true, rexmt_int / 1000000L, rexmt_cnt);
-
-					// Ignore SIGPIPE when supported (ie. BSD/MacOS)
-					setSockNoSIGPIPE(tcpsocket, 1);
-
-					// Enable Port Re-use
-					setSockReuseAddrPort(tcpsocket);
-
-					// Apply Default Send Timeout Settings to Socket
-					setSockTimeout(tcpsocket, SO_SNDTIMEO, rexmt_int);
-
-					// Disable Nagle Algo to send immediately. Or may be we shouldn't disable Nagle since there is PtpFlush function?
-					setSockNoDelay(tcpsocket, 1);
-
-					// Binding Information for local Port
-					struct sockaddr_in addr {};
-					// addr.sin_len = sizeof(addr);
-					addr.sin_family = AF_INET;
-					addr.sin_addr.s_addr = INADDR_ANY;
-					if (isLocalServer) {
-						getLocalIp(&addr);
-					}
-					uint16_t requestedport = static_cast<int>(sport + static_cast<int>(portOffset));
-					// Avoid getting random port due to port offset when original port wasn't 0 (ie. original_port + port_offset = 65536 = 0)
-					if (requestedport == 0 && sport > 0)
-						requestedport = 65535; // Hopefully it will be safe to default it to 65535 since there can't be more than one port that can bumped into 65536
-					// Show a warning about privileged ports
-					if (requestedport != 0 && requestedport < 1024) {
-						WARN_LOG(Log::sceNet, "sceNetAdhocPtpOpen - Ports below 1024(ie. %hu) may require Admin Privileges", requestedport);
-					}
-					addr.sin_port = htons(requestedport);
-
-					// Bound Socket to local Port
-					if (bind(tcpsocket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-						// Update sport with the port assigned internal->lport = ntohs(local.sin_port)
-						socklen_t len = sizeof(addr);
-						if (getsockname(tcpsocket, (struct sockaddr*)&addr, &len) == 0) {
-							uint16_t boundport = ntohs(addr.sin_port);
-							if (sport + static_cast<int>(portOffset) >= 65536 || static_cast<int>(boundport) - static_cast<int>(portOffset) <= 0)
-								WARN_LOG(Log::sceNet, "sceNetAdhocPtpOpen - Wrapped Port Detected: Original(%d) -> Requested(%d), Bound(%d) -> BoundOriginal(%d)", sport, requestedport, boundport, boundport - portOffset);
-							sport = boundport - portOffset;
-						}
-
-						// Allocate Memory
-						AdhocSocket* internal = (AdhocSocket*)malloc(sizeof(AdhocSocket));
-
-						// Allocated Memory
-						if (internal != NULL) {
-							// Find Free Translator ID
-							// FIXME: We should probably use an increasing index instead of looking for an empty slot from beginning if we want to simulate a real socket id
-							int i = 0;
-							i = FindFreeAdhocSocketSlot();
-
-							// Found Free Translator ID
-							if (i < MAX_SOCKET) {
-								// Clear Memory
-								memset(internal, 0, sizeof(AdhocSocket));
-
-								// Socket Type
-								internal->type = SOCK_PTP;
-								internal->retry_interval = rexmt_int;
-								internal->retry_count = rexmt_cnt;
-								internal->nonblocking = flag;
-								internal->buffer_size = bufsize;
-								internal->isClient = isClient;
-
-								// Copy Infrastructure Socket ID
-								internal->data.ptp.id = tcpsocket;
-
-								// Copy Address & Port Information
-								internal->data.ptp.laddr = *saddr;
-								internal->data.ptp.paddr = *daddr;
-								internal->data.ptp.lport = sport;
-								internal->data.ptp.pport = dport;
-
-								// Link PTP Socket
-								adhocSockets[i] = internal;
-
-								// Add Port Forward to Router. We may not even need to forward this local port, since PtpOpen usually have port 0 (any port) as source port and followed by PtpConnect (which mean acting as Client), right?
-								//sceNetPortOpen("TCP", sport);
-								if (!isClient)
-									UPnP_Add(IP_PROTOCOL_TCP, isOriPort ? sport : sport + portOffset, sport + portOffset);
-
-								// Switch to non-blocking for futher usage
-								changeBlockingMode(tcpsocket, 1);
-
-								// PtpOpen starts connecting by itself, as on the PSP (see ptp_open_postoffice).
-								// TODO: Need to handle ECONNREFUSED better on non-Windows, if there are games that never called PtpConnect and only relies on [blocking?] PtpOpen to get connected
-								NetAdhocPtp_Connect(i + 1, rexmt_int, 1, false);
-
-								// Workaround to give some time to get connected before returning from PtpOpen over high latency
-								INFO_LOG(Log::sceNet, "sceNetAdhocPtpOpen - PSP Socket id: %i, Host Socket id: %i", i + 1, tcpsocket);
-
-								// Return PTP Socket id
-								if (g_Config.bForcedFirstConnect && internal->attemptCount == 1) {
-									return hleDelayResult(hleLogDebug(Log::sceNet, i + 1), "delayed ptpopen", rexmt_int);
-								} else {
-									return hleLogDebug(Log::sceNet, i + 1);
-								}
-							}
-
-							// Free Memory
-							free(internal);
-						}
-					}
-					else {
-						ERROR_LOG(Log::sceNet, "Socket error (%i) when binding port %u", socket_errno, ntohs(addr.sin_port));
-						auto n = GetI18NCategory(I18NCat::NETWORKING);
-						g_OSD.Show(OSDType::MESSAGE_ERROR,
-							std::string(n->T("Failed to Bind Port")) + " " + std::to_string(sport + portOffset) + "\n" + std::string(n->T("Please change your Port Offset")), 0.0f, "portbindfail");
-					}
-
-					// Close Socket
-					closesocket(tcpsocket);
-
-					// Port not available (exclusively in use?)
-					return hleLogDebug(Log::sceNet, SCE_NET_ADHOC_ERROR_PORT_NOT_AVAIL, "port not available"); // SCE_NET_ADHOC_ERROR_PORT_IN_USE; // SCE_NET_ADHOC_ERROR_INVALID_PORT;
-				}
+				return Transport().PtpOpen(saddr, sport, daddr, dport, bufsize, rexmt_int, rexmt_cnt, flag);
 			}
 
 			// Invalid Arguments
@@ -5218,6 +3804,7 @@ int AcceptPtpSocket(int ptpId, int newsocket, sockaddr_in& peeraddr, SceNetEther
  * @param flag Nonblocking Flag
  * @return Socket ID >= 0 on success or... ADHOC_NOT_INITIALIZED, ADHOC_INVALID_ARG, ADHOC_INVALID_SOCKET_ID, ADHOC_SOCKET_DELETED, ADHOC_SOCKET_ALERTED, ADHOC_SOCKET_ID_NOT_AVAIL, ADHOC_WOULD_BLOCK, ADHOC_TIMEOUT, ADHOC_NOT_LISTENED, ADHOC_THREAD_ABORTED, NET_INTERNAL
  */
+
 static int sceNetAdhocPtpAccept(MIPSState *mips, int id, u32 peerMacAddrPtr, u32 peerPortPtr, int timeout, int flag) {
 
 	SceNetEtherAddr * addr = NULL;
@@ -5259,56 +3846,7 @@ static int sceNetAdhocPtpAccept(MIPSState *mips, int id, u32 peerMacAddrPtr, u32
 				if (ptpsocket.state == ADHOC_PTP_STATE_LISTEN) {
 					hleEatMicro(50);
 
-					// Address Information
-					struct sockaddr_in peeraddr;
-					memset(&peeraddr, 0, sizeof(peeraddr));
-					socklen_t peeraddrlen = sizeof(peeraddr);
-					int error = 0;
-
-					int newsocket = 0;
-					if (serverHasRelay) {
-						newsocket = ptp_accept_postoffice(id - 1, addr, port);
-						if (newsocket >= 0) {
-							return newsocket;
-						} else {
-							newsocket = SOCKET_ERROR;
-							error = EAGAIN;
-						}
-					} else {
-						// Check if listening socket is ready to accept
-						newsocket = IsSocketReady(ptpsocket.id, true, false, &error);
-						if (newsocket > 0) {
-							// Accept Connection
-							newsocket = accept(ptpsocket.id, (struct sockaddr*)&peeraddr, &peeraddrlen);
-							error = socket_errno;
-						}
-					}
-
-					if (newsocket == 0 || (newsocket == SOCKET_ERROR && (error == EAGAIN || error == EWOULDBLOCK))) {
-						if (flag == 0) {
-							// Simulate blocking behaviour with non-blocking socket
-							u64 threadSocketId = ((u64)__KernelGetCurThread()) << 32 | ptpsocket.id;
-							return WaitBlockingAdhocSocket(threadSocketId, PTP_ACCEPT, id, nullptr, nullptr, timeout, addr, port, "ptp accept");
-						}
-						// Prevent spamming Debug Log with retries of non-bocking socket
-						else {
-							VERBOSE_LOG(Log::sceNet, "sceNetAdhocPtpAccept[%i]: Socket Error (%i)", id, error);
-						}
-					}
-
-					// Accepted New Connection
-					if (newsocket > 0) {
-						int newid = AcceptPtpSocket(id, newsocket, peeraddr, addr, port);
-						if (newid >= 0)
-							return newid;
-					}
-
-					// Action would block
-					if (flag)
-						return hleLogVerbose(Log::sceNet, SCE_NET_ADHOC_ERROR_WOULD_BLOCK, "would block");
-
-					// Timeout
-					return hleLogVerbose(Log::sceNet, SCE_NET_ADHOC_ERROR_TIMEOUT, "timeout");
+					return Transport().PtpAccept(id, addr, port, timeout, flag);
 				}
 
 				// Client Socket
@@ -5339,12 +3877,8 @@ int NetAdhocPtp_Connect(int id, int timeout, int flag, bool allowForcedConnect) 
 			socket->nonblocking = flag;
 
 			// A connection PtpOpen started may have come up since.
-			if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT && !serverHasRelay) {
-				struct sockaddr_in peer;
-				socklen_t peerLen = sizeof(peer);
-				if (getpeername(ptpsocket.id, (struct sockaddr *)&peer, &peerLen) == 0) {
-					ptpSetEstablished(socket);
-				}
+			if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT && Transport().PtpConnectedSinceOpen(socket)) {
+				ptpSetEstablished(socket);
 			}
 
 			// Connecting a connected socket returns 0 on the PSP, even with the connect alert set (pspautotests
@@ -5378,18 +3912,8 @@ int NetAdhocPtp_Connect(int id, int timeout, int flag, bool allowForcedConnect) 
 
 					// Connect Socket to Peer
 					// NOTE: Based on what i read at stackoverflow, The First Non-blocking POSIX connect will always returns EAGAIN/EWOULDBLOCK because it returns without waiting for ACK/handshake, But GvG Next Plus is treating non-blocking PtpConnect just like blocking connect, May be on a real PSP the first non-blocking sceNetAdhocPtpConnect can be successfull?
-					int connectresult = 0;
 					int errorcode = 0;
-					if (serverHasRelay) {
-						connectresult = ptp_connect_postoffice(id - 1, __func__);
-						if (connectresult != 0) {
-							connectresult = SOCKET_ERROR;
-							errorcode = EAGAIN;
-						}
-					} else {
-						connectresult = connect(ptpsocket.id, (struct sockaddr*)&sin, sizeof(sin));
-						errorcode = socket_errno;
-					}
+					int connectresult = Transport().PtpConnect(id, sin, &errorcode);
 
 					if (connectresult == SOCKET_ERROR) {
 						if (errorcode == EAGAIN || errorcode == EWOULDBLOCK || errorcode == EALREADY || errorcode == EISCONN)
@@ -5413,8 +3937,8 @@ int NetAdhocPtp_Connect(int id, int timeout, int flag, bool allowForcedConnect) 
 					else if (connectresult == SOCKET_ERROR) {
 						// Connection in Progress, or
 						// ECONNREFUSED = No connection could be made because the target device actively refused it (on Windows/Linux/Android), or no one listening on the remote address (on Linux/Android) thus should try to connect again later (treated similarly to ETIMEDOUT/ENETUNREACH).
-						if (serverHasRelay || connectInProgress(errorcode) || errorcode == ECONNREFUSED) {
-							if (serverHasRelay || connectInProgress(errorcode))
+						if (Transport().PtpConnectPending(errorcode) || errorcode == ECONNREFUSED) {
+							if (Transport().PtpConnectPending(errorcode))
 							{
 								ptpsocket.state = ADHOC_PTP_STATE_SYN_SENT;
 							}
@@ -5484,29 +4008,6 @@ static int sceNetAdhocPtpConnect(MIPSState *mips, int id, int timeout, int flag)
 	return NetAdhocPtp_Connect(id, timeout, flag);
 }
 
-static int ptp_close_postoffice(int idx) {
-	AdhocSocket *internal = adhocSockets[idx];
-
-	// sync
-	if (internal->connectThread != NULL) {
-		internal->connectThread->join();
-		delete internal->connectThread;
-	}
-
-	void *socket = internal->postofficeHandle;
-	if (socket != NULL) {
-		if (internal->data.ptp.state == ADHOC_PTP_STATE_LISTEN) {
-			ptp_listen_close(socket);
-		} else {
-			ptp_close(socket);
-		}
-	}
-	adhocSockets[idx] = NULL;
-	free(internal);
-	INFO_LOG(Log::sceNet, "%s: closed ptp socket with id %d", __func__, idx + 1);
-	return 0;
-}
-
 int NetAdhocPtp_Close(int id, int unknown) {
 	// Library is initialized
 	if (netAdhocInited) {
@@ -5517,25 +4018,7 @@ int NetAdhocPtp_Close(int id, int unknown) {
 
 			// Valid Socket
 			if (socket != NULL && socket->type == SOCK_PTP) {
-				if (serverHasRelay)
-					return ptp_close_postoffice(id - 1);
-
-				// Close Connection
-				shutdown(socket->data.ptp.id, SD_RECEIVE);
-				closesocket(socket->data.ptp.id);
-
-				// Remove Port Forward from Router
-				//sceNetPortClose("TCP", socket->lport);
-				//g_PortManager.Remove(IP_PROTOCOL_TCP, isOriPort ? socket->lport : socket->lport + portOffset); // Let's not remove mapping in real-time as it could cause lags/disconnection when joining a room with slow routers
-
-				// Free Memory
-				free(socket);
-
-				// Free Reference
-				adhocSockets[id - 1] = NULL;
-
-				// Success
-				return 0;
+				return Transport().PtpClose(id);
 			}
 
 			return SCE_NET_ADHOC_ERROR_INVALID_SOCKET_ID;
@@ -5568,54 +4051,6 @@ static int sceNetAdhocPtpClose(MIPSState *mips, int id, int unknown) {
 	return NetAdhocPtp_Close(id, unknown);
 }
 
-static int ptp_listen_postoffice(const SceNetEtherAddr *saddr, uint16_t sport, uint32_t bufsize, uint32_t rexmt_int, int rexmt_cnt) {
-	if (relayDisabled) {
-		return ERROR_NET_NO_SPACE;
-	}
-
-	// server connect delegated to accept
-	AdhocSocket *internal = (AdhocSocket *)malloc(sizeof(AdhocSocket));
-	if (internal == NULL) {
-		ERROR_LOG(Log::sceNet, "%s: out of heap memory when creating ptp listen socket", __func__);
-		return ERROR_NET_NO_SPACE;
-	}
-	memset(internal, 0, sizeof(AdhocSocket));
-	internal->retry_interval = rexmt_int;
-	internal->retry_count = rexmt_cnt;
-
-	internal->postofficeHandle = NULL;
-	internal->type = SOCK_PTP;
-	internal->data.ptp.laddr = *saddr;
-	internal->data.ptp.lport = sport;
-	internal->data.ptp.state = ADHOC_PTP_STATE_LISTEN;
-	internal->data.ptp.rcv_sb_cc = bufsize;
-	internal->data.ptp.snd_sb_cc = 0;
-	internal->flags = 0;
-	internal->connectThread = NULL;
-	internal->lastAttempt = 0;
-	internal->internalLastAttempt = 0;
-
-	AdhocSocket **slot = NULL;
-	int i;
-	i = FindFreeAdhocSocketSlot();
-	if (i < MAX_SOCKET) {
-		slot = &adhocSockets[i];
-	}
-
-	if (slot == NULL) {
-		ERROR_LOG(Log::sceNet, "%s: out of socket slots when creating adhoc ptp listen socket", __func__);
-		free(internal);
-		return ERROR_NET_NO_SPACE;
-	}
-
-	internal->data.ptp.id = AEMU_POSTOFFICE_ID_BASE + i;
-
-	*slot = internal;
-	ptp_listen_postoffice_recover(i);
-	INFO_LOG(Log::sceNet, "%s: created ptp listen socket with id %d %p", __func__, i + 1, internal->postofficeHandle);
-	return i + 1;
-}
-
 /**
  * Adhoc Emulator PTP Passive Socket Creator
  * @param saddr Local MAC (Unused)
@@ -5627,6 +4062,7 @@ static int ptp_listen_postoffice(const SceNetEtherAddr *saddr, uint16_t sport, u
  * @param flag Bitflags (Unused)
  * @return Socket ID > 0 on success or... ADHOC_NOT_INITIALIZED, ADHOC_INVALID_ARG, ADHOC_INVALID_ADDR, ADHOC_INVALID_PORT, ADHOC_SOCKET_ID_NOT_AVAIL, ADHOC_PORT_NOT_AVAIL, ADHOC_PORT_IN_USE, NET_NO_SPACE
  */
+
 static int sceNetAdhocPtpListen(MIPSState *mips, const char *srcmac, int sport, int bufsize, int rexmt_int, int rexmt_cnt, int backlog, int flag) {
 	INFO_LOG(Log::sceNet, "sceNetAdhocPtpListen(%s, %d, %d, %d, %d, %d, %d) at %08x", mac2str((SceNetEtherAddr*)srcmac).c_str(), sport,bufsize,rexmt_int,rexmt_cnt,backlog,flag, mips->pc);
 	if (!g_Config.bEnableWlan) {
@@ -5652,9 +4088,12 @@ static int sceNetAdhocPtpListen(MIPSState *mips, const char *srcmac, int sport, 
 	}
 
 	if (netAdhocInited) {
-		// Some games (ie. DBZ Shin Budokai 2) might be getting the saddr/srcmac content from SaveState and causing problems :( So we try to fix it here
+		// Some games (ie. DBZ Shin Budokai 2) might be getting the saddr/srcmac content from SaveState and causing problems if
+		// current MAC is different :( So we use the local MAC instead, without writing it into the game's memory.
+		SceNetEtherAddr localSrcMac;
 		if (saddr != NULL) {
-			getLocalMac(saddr);
+			getLocalMac(&localSrcMac);
+			saddr = &localSrcMac;
 		}
 		// Valid Address. FIXME: MAC only valid after successful attempt to Create/Connect/Join a Group? (ie. adhocctlCurrentMode != ADHOCCTL_MODE_NONE)
 		if ((adhocctlCurrentMode != ADHOCCTL_MODE_NONE) && saddr != NULL && isLocalMAC(saddr)) {
@@ -5674,138 +4113,7 @@ static int sceNetAdhocPtpListen(MIPSState *mips, const char *srcmac, int sport, 
 			// Valid Arguments
 			if (bufsize > 0 && rexmt_int >= 0 && rexmt_cnt >= 0 && backlog >= 0)
 			{
-				if (serverHasRelay)
-					return ptp_listen_postoffice(saddr, sport, bufsize, rexmt_int, rexmt_cnt);
-
-				// Create Infrastructure Socket (?)
-				// Socket is remapped through adhocSockets
-				int tcpsocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-				// Valid Socket produced
-				if (tcpsocket > 0) {
-					// Change socket MSS
-					setSockMSS(tcpsocket, PSP_ADHOC_PTP_MSS);
-
-					// Change socket buffer size to be consistent on all platforms.
-					setSockBufferSize(tcpsocket, SO_SNDBUF, bufsize*5); //PSP_ADHOC_PTP_MSS
-					setSockBufferSize(tcpsocket, SO_RCVBUF, bufsize*10); //PSP_ADHOC_PTP_MSS*10
-
-					// Enable KeepAlive
-					setSockKeepAlive(tcpsocket, true, rexmt_int / 1000000L, rexmt_cnt);
-
-					// Ignore SIGPIPE when supported (ie. BSD/MacOS)
-					setSockNoSIGPIPE(tcpsocket, 1);
-
-					// Enable Port Re-use
-					setSockReuseAddrPort(tcpsocket);
-
-					// Apply Default Receive Timeout Settings to Socket
-					setSockTimeout(tcpsocket, SO_RCVTIMEO, rexmt_int);
-
-					// Disable Nagle Algo to send immediately. Or may be we shouldn't disable Nagle since there is PtpFlush function?
-					setSockNoDelay(tcpsocket, 1);
-
-					// Binding Information for local Port
-					struct sockaddr_in addr {};
-					addr.sin_family = AF_INET;
-					addr.sin_addr.s_addr = INADDR_ANY;
-					if (isLocalServer) {
-						getLocalIp(&addr);
-					}
-					uint16_t requestedport = static_cast<int>(sport + static_cast<int>(portOffset));
-					// Avoid getting random port due to port offset when original port wasn't 0 (ie. original_port + port_offset = 65536 = 0)
-					if (requestedport == 0 && sport > 0)
-						requestedport = 65535; // Hopefully it will be safe to default it to 65535 since there can't be more than one port that can bumped into 65536
-					// Show a warning about privileged ports
-					if (requestedport != 0 && requestedport < 1024) {
-						WARN_LOG(Log::sceNet, "sceNetAdhocPtpListen - Ports below 1024(ie. %hu) may require Admin Privileges", requestedport);
-					}
-					addr.sin_port = htons(requestedport);
-
-					int iResult = 0;
-					// Bound Socket to local Port
-					if ((iResult = bind(tcpsocket, (struct sockaddr*)&addr, sizeof(addr))) == 0) {
-						// Update sport with the port assigned internal->lport = ntohs(local.sin_port)
-						socklen_t len = sizeof(addr);
-						if (getsockname(tcpsocket, (struct sockaddr*)&addr, &len) == 0) {
-							uint16_t boundport = ntohs(addr.sin_port);
-							if (sport + static_cast<int>(portOffset) >= 65536 || static_cast<int>(boundport) - static_cast<int>(portOffset) <= 0)
-								WARN_LOG(Log::sceNet, "sceNetAdhocPtpListen - Wrapped Port Detected: Original(%d) -> Requested(%d), Bound(%d) -> BoundOriginal(%d)", sport, requestedport, boundport, boundport - portOffset);
-							sport = boundport - portOffset;
-						}
-						// Switch into Listening Mode
-						if ((iResult = listen(tcpsocket, backlog)) == 0) {
-							// Allocate Memory
-							AdhocSocket* internal = (AdhocSocket*)malloc(sizeof(AdhocSocket));
-
-							// Allocated Memory
-							if (internal != NULL) {
-								// Find Free Translator ID
-								// FIXME: We should probably use an increasing index instead of looking for an empty slot from beginning if we want to simulate a real socket id
-								int i = 0;
-								i = FindFreeAdhocSocketSlot();
-
-								// Found Free Translator ID
-								if (i < MAX_SOCKET) {
-									// Clear Memory
-									memset(internal, 0, sizeof(AdhocSocket));
-
-									// Socket Type
-									internal->type = SOCK_PTP;
-									internal->retry_interval = rexmt_int;
-									internal->retry_count = rexmt_cnt;
-									internal->nonblocking = flag;
-									internal->buffer_size = bufsize;
-									internal->isClient = isClient;
-
-									// Copy Infrastructure Socket ID
-									internal->data.ptp.id = tcpsocket;
-
-									// Copy Address & Port Information
-									internal->data.ptp.laddr = *saddr;
-									internal->data.ptp.lport = sport;
-
-									// Flag Socket as Listener
-									internal->data.ptp.state = ADHOC_PTP_STATE_LISTEN;
-
-									// Link PTP Socket
-									adhocSockets[i] = internal;
-
-									// Add Port Forward to Router
-									//sceNetPortOpen("TCP", sport);
-									UPnP_Add(IP_PROTOCOL_TCP, isOriPort ? sport : sport + portOffset, sport + portOffset);
-
-									// Switch to non-blocking for futher usage
-									changeBlockingMode(tcpsocket, 1);
-
-									// Return PTP Socket id
-									return hleLogDebug(Log::sceNet, i + 1, "sceNetAdhocPtpListen - PSP Socket id: %i, Host Socket id: %i", i + 1, tcpsocket);
-								}
-
-								// Free Memory
-								free(internal);
-							}
-						}
-					}
-					else {
-						auto n = GetI18NCategory(I18NCat::NETWORKING);
-						g_OSD.Show(OSDType::MESSAGE_ERROR, std::string(n->T("Failed to Bind Port")) + " " + std::to_string(sport + portOffset) + "\n" + std::string(n->T("Please change your Port Offset")), 0.0f, "portbindfail");
-					}
-
-					if (iResult == SOCKET_ERROR) {
-						int error = socket_errno;
-						ERROR_LOG(Log::sceNet, "sceNetAdhocPtpListen[%i]: Socket Error (%i)", sport, error);
-					}
-
-					// Close Socket
-					closesocket(tcpsocket);
-
-					// Port not available (exclusively in use?)
-					return hleLogDebug(Log::sceNet, SCE_NET_ADHOC_ERROR_PORT_NOT_AVAIL, "port not available"); //SCE_NET_ADHOC_ERROR_PORT_IN_USE; // SCE_NET_ADHOC_ERROR_INVALID_PORT;
-				}
-
-				// Socket not available
-				return hleLogDebug(Log::sceNet, SCE_NET_ADHOC_ERROR_SOCKET_ID_NOT_AVAIL, "socket id not available");
+				return Transport().PtpListen(saddr, sport, bufsize, rexmt_int, rexmt_cnt, backlog, isClient, flag);
 			}
 
 			// Invalid Arguments
@@ -5829,6 +4137,7 @@ static int sceNetAdhocPtpListen(MIPSState *mips, const char *srcmac, int sport, 
  * @param flag Nonblocking Flag
  * @return 0 on success or... ADHOC_NOT_INITIALIZED, ADHOC_INVALID_ARG, ADHOC_INVALID_SOCKET_ID, ADHOC_SOCKET_DELETED, ADHOC_SOCKET_ALERTED, ADHOC_WOULD_BLOCK, ADHOC_TIMEOUT, ADHOC_NOT_CONNECTED, ADHOC_THREAD_ABORTED, ADHOC_INVALID_DATALEN, ADHOC_DISCONNECTED, NET_INTERNAL, NET_NO_SPACE
  */
+
 static int sceNetAdhocPtpSend(MIPSState *mips, int id, u32 dataAddr, u32 dataSizeAddr, int timeout, int flag) {
 	DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend(%d,%08x,%08x,%d,%d) at %08x", id, dataAddr, dataSizeAddr, timeout, flag, mips->pc);
 
@@ -5870,68 +4179,7 @@ static int sceNetAdhocPtpSend(MIPSState *mips, int id, u32 dataAddr, u32 dataSiz
 						return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_SOCKET_ALERTED, "socket alerted");
 					}
 
-					// Acquire Network Lock
-					// _acquireNetworkLock();
-
-					// Send Data
-					int sent = 0;
-					int error = 0;
-					if (serverHasRelay) {
-						sent = ptp_send_postoffice(id - 1, data, len);
-						if (sent == 0) {
-							// sent
-							hleEatMicro(50);
-							return 0;
-						}
-						if (sent == SOCKET_ERROR) {
-							ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-							return SCE_NET_ADHOC_ERROR_DISCONNECTED;
-						}
-						// SCE_NET_ADHOC_ERROR_WOULD_BLOCK
-						sent = SOCKET_ERROR;
-						error = EAGAIN;
-					}else{
-						sent = send(ptpsocket.id, data, *len, MSG_NOSIGNAL);
-						error = socket_errno;
-					}
-
-					// Free Network Lock
-					// _freeNetworkLock();
-
-					// Success
-					if (sent > 0) {
-						hleEatMicro(50); // mostly 1ms, sometimes 1~10ms ? doesn't seems to be switching to a different thread during this duration
-						// Save Length
-						*len = sent;
-
-						DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend[%i:%u]: Sent %u bytes to %s:%u\n", id, ptpsocket.lport, sent, mac2str(&ptpsocket.paddr).c_str(), ptpsocket.pport);
-
-						// Set to Established on successful Send when an attempt to Connect was initiated
-						if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT)
-							ptpsocket.state = ADHOC_PTP_STATE_ESTABLISHED;
-
-						// Return Success
-						return 0;
-					}
-
-					// Non-Critical Error
-					else if (sent == SOCKET_ERROR && (error == EAGAIN || error == EWOULDBLOCK || (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT && (error == ENOTCONN || connectInProgress(error))))) {
-						// Non-Blocking
-						if (flag)
-							return hleLogVerbose(Log::sceNet, SCE_NET_ADHOC_ERROR_WOULD_BLOCK, "would block");
-
-						// Simulate blocking behaviour with non-blocking socket
-						u64 threadSocketId = ((u64)__KernelGetCurThread()) << 32 | ptpsocket.id;
-						return WaitBlockingAdhocSocket(threadSocketId, PTP_SEND, id, (void*)data, len, timeout, nullptr, nullptr, "ptp send");
-					}
-
-					DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpSend[%i:%u -> %s:%u]: Result:%i (Error:%i)", id, ptpsocket.lport, mac2str(&ptpsocket.paddr).c_str(), ptpsocket.pport, sent, error);
-
-					// Change Socket State
-					ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-
-					// Disconnected
-					return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_DISCONNECTED, "disconnected");
+					return Transport().PtpSend(id, data, len, timeout, flag);
 				}
 
 				// Invalid Arguments
@@ -5963,6 +4211,7 @@ static int sceNetAdhocPtpSend(MIPSState *mips, int id, u32 dataAddr, u32 dataSiz
  * @param flag Nonblocking Flag
  * @return 0 on success or... ADHOC_NOT_INITIALIZED, ADHOC_INVALID_ARG, ADHOC_INVALID_SOCKET_ID, ADHOC_SOCKET_DELETED, ADHOC_SOCKET_ALERTED, ADHOC_WOULD_BLOCK, ADHOC_TIMEOUT, ADHOC_THREAD_ABORTED, ADHOC_DISCONNECTED, NET_INTERNAL
  */
+
 static int sceNetAdhocPtpRecv(MIPSState *mips, int id, u32 dataAddr, u32 dataSizeAddr, int timeout, int flag) {
 	DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv(%d,%08x,%08x,%d,%d) at %08x", id, dataAddr, dataSizeAddr, timeout, flag, mips->pc);
 
@@ -5993,82 +4242,7 @@ static int sceNetAdhocPtpRecv(MIPSState *mips, int id, u32 dataAddr, u32 dataSiz
 						return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_SOCKET_ALERTED, "socket alerted");
 					}
 
-					// Acquire Network Lock
-					// _acquireNetworkLock();
-
-					// TODO: Use a different thread (similar to sceIo) for recvfrom, recv & accept to prevent blocking-socket from blocking emulation
-					int received = 0;
-					int error = 0;
-
-					if (serverHasRelay) {
-						received = ptp_recv_postoffice(id - 1, buf, len);
-						if (received == 0) {
-							// we got data
-							DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv[%i:%u]: Result:%i (Error:%i)", id, ptpsocket.lport, received, error);
-							hleEatMicro(50);
-							return 0;
-						}
-						if (received == SOCKET_ERROR) {
-							// the socket died, let the game know
-							ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-							DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv[%i:%u]: Result:%i (Error:%i)", id, ptpsocket.lport, received, error);
-							return SCE_NET_ADHOC_ERROR_DISCONNECTED;
-						}
-						// SCE_NET_ADHOC_ERROR_WOULD_BLOCK
-						received = SOCKET_ERROR;
-						error = EAGAIN;
-					} else {
-						// Receive Data. POSIX: May received 0 bytes when the remote peer already closed the connection.
-						received = recv(ptpsocket.id, (char*)buf, std::max(0, *len), MSG_NOSIGNAL);
-						error = socket_errno;
-					}
-
-					if (received == SOCKET_ERROR && (error == EAGAIN || error == EWOULDBLOCK || (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT && (error == ENOTCONN || connectInProgress(error))))) {
-						if (flag == 0) {
-							// Simulate blocking behaviour with non-blocking socket
-							u64 threadSocketId = ((u64)__KernelGetCurThread()) << 32 | ptpsocket.id;
-							return WaitBlockingAdhocSocket(threadSocketId, PTP_RECV, id, buf, len, timeout, nullptr, nullptr, "ptp recv");
-						}
-
-						return hleLogVerbose(Log::sceNet, SCE_NET_ADHOC_ERROR_WOULD_BLOCK, "would block");
-					}
-
-					// Free Network Lock
-					// _freeNetworkLock();
-
-					hleEatMicro(50);
-
-					// Received Data
-					if (received > 0) {
-						// Save Length
-						*len = received;
-
-						// Update last recv timestamp, may cause disconnection not detected properly tho
-						peerlock.lock();
-						auto peer = findFriend(&ptpsocket.paddr);
-						if (peer != NULL) peer->last_recv = CoreTiming::GetGlobalTimeUsScaled();
-						peerlock.unlock();
-
-						DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv[%i:%u]: Received %u bytes from %s:%u\n", id, ptpsocket.lport, received, mac2str(&ptpsocket.paddr).c_str(), ptpsocket.pport);
-
-						// Set to Established on successful Recv when an attempt to Connect was initiated
-						if (ptpsocket.state == ADHOC_PTP_STATE_SYN_SENT)
-							ptpsocket.state = ADHOC_PTP_STATE_ESTABLISHED;
-
-						// Return Success
-						return 0;
-					}
-
-					DEBUG_LOG(Log::sceNet, "sceNetAdhocPtpRecv[%i:%u]: Result:%i (Error:%i)", id, ptpsocket.lport, received, error);
-
-					if (*len == 0)
-						return 0;
-
-					// Change Socket State
-					ptpsocket.state = ADHOC_PTP_STATE_CLOSED;
-
-					// Disconnected
-					return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_DISCONNECTED, "disconnected");
+					return Transport().PtpRecv(id, buf, len, timeout, flag);
 				}
 
 				// A connection whose peer has gone stays DISCONNECTED (pspautotests net/adhoc/ptp).
@@ -6092,27 +4266,7 @@ static int sceNetAdhocPtpRecv(MIPSState *mips, int id, u32 dataAddr, u32 dataSiz
 }
 
 int FlushPtpSocket(int socketId) {
-	if (serverHasRelay) {
-		// there's no manual flushing in the relay library, it's by default no delay there
-		return 0;
-	}
-
-	// Get original Nagle algo value
-	int n = getSockNoDelay(socketId);
-
-	// Disable Nagle Algo to send immediately
-	setSockNoDelay(socketId, 1);
-
-	// Send Empty Data just to trigger Nagle on/off effect to flush the send buffer, Do we need to trigger this at all or is it automatically flushed?
-	//changeBlockingMode(socket->id, nonblock);
-	int ret = send(socketId, "", 0, MSG_NOSIGNAL);
-	if (ret == SOCKET_ERROR) ret = socket_errno;
-	//changeBlockingMode(socket->id, 1);
-
-	// Restore/Enable Nagle Algo
-	setSockNoDelay(socketId, n);
-
-	return ret;
+	return Transport().PtpFlush(socketId);
 }
 
 /**
@@ -6144,7 +4298,7 @@ static int sceNetAdhocPtpFlush(MIPSState *mips, int id, int timeout, int nonbloc
 
 			// Connected Socket
 			if (ptpsocket.state == ADHOC_PTP_STATE_ESTABLISHED) {
-				hleEatMicro(50);
+				hleEatMicro(196);
 				// There are two ways to flush, you can either set TCP_NODELAY to 1 or TCP_CORK to 0.
 				// Apply Send Timeout Settings to Socket
 				setSockTimeout(ptpsocket.id, SO_SNDTIMEO, timeout);
@@ -6197,6 +4351,10 @@ static int sceNetAdhocGameModeCreateMaster(MIPSState *mips, u32 dataAddr, int si
 
 	if (size < 0 || !Memory::IsValidAddress(dataAddr))
 		return hleLogError(Log::sceNet, SCE_NET_ADHOCCTL_ERROR_INVALID_ARG, "invalid arg");
+
+	// pspautotests net/adhoc/pair/gamemode
+	if (size == 0)
+		return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_INVALID_DATALEN, "invalid data length");
 
 	if (masterGameModeArea.data)
 		return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_ALREADY_CREATED, "already created"); // FIXME: Should we return a success instead? (need to test this on a homebrew)
@@ -6251,18 +4409,23 @@ static int sceNetAdhocGameModeCreateReplica(MIPSState *mips, const char *mac, u3
 	if (mac == nullptr || size < 0 || !Memory::IsValidAddress(dataAddr))
 		return hleLogError(Log::sceNet, SCE_NET_ADHOCCTL_ERROR_INVALID_ARG, "invalid arg");
 
+	const SceNetEtherAddr &replicaMac = *(const SceNetEtherAddr *)mac;
+	// The ID is the member's place in the member list (the host first), and a MAC that isn't a member is
+	// refused. With two consoles, the host's replica of the client is 1 and the client's of the host 0
+	// (pspautotests net/adhoc/pair/gamemode).
+	auto member = std::find_if(gameModeMacs.begin(), gameModeMacs.end(), [&](const SceNetEtherAddr &m) { return IsMatch(m, replicaMac); });
+	if (member == gameModeMacs.end())
+		return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_NOT_GAMEMODE_MEMBER, "not a member");
+	int replicaId = (int)(member - gameModeMacs.begin());
+
 	hleEatMicro(1000);
-	int maxid = 0;
 	auto it = std::find_if(replicaGameModeAreas.begin(), replicaGameModeAreas.end(),
-		[mac, &maxid](GameModeArea const& e) {
-			if (e.id > maxid) maxid = e.id;
-			return IsMatch(e.mac, mac);
+		[&](GameModeArea const& e) {
+			return IsMatch(e.mac, replicaMac);
 		});
-	// MAC address already existed!
-	if (it != replicaGameModeAreas.end()) {
-		WARN_LOG(Log::sceNet, "sceNetAdhocGameModeCreateReplica - [%s] is already existed (id: %d)", mac2str((SceNetEtherAddr*)mac).c_str(), it->id);
-		return it->id; // SCE_NET_ADHOC_ERROR_ALREADY_CREATED
-	}
+	// pspautotests net/adhoc/pair/gamemode
+	if (it != replicaGameModeAreas.end())
+		return hleLogError(Log::sceNet, SCE_NET_ADHOC_ERROR_ALREADY_CREATED, "already created");
 
 	int ret = 0;
 	gameModeBuffSize = std::max(gameModeBuffSize, size);
@@ -6274,9 +4437,9 @@ static int sceNetAdhocGameModeCreateReplica(MIPSState *mips, const char *mac, u3
 	if (data) {
 		Memory::Memcpy(data, dataAddr, size);
 		//int sock = sceNetAdhocPdpCreate(mac, ADHOC_GAMEMODE_PORT, size, 0);
-		GameModeArea gma = { maxid + 1, size, dataAddr, CoreTiming::GetGlobalTimeUsScaled(), 0, 0, *(SceNetEtherAddr*)mac, data };
+		GameModeArea gma = { replicaId, size, dataAddr, CoreTiming::GetGlobalTimeUsScaled(), 0, 0, replicaMac, data };
 		replicaGameModeAreas.push_back(gma);
-		ret = gma.id; // Valid id for replica is higher than 0?
+		ret = gma.id;
 
 		// Block current thread to sync initial master data after Master and all Replicas have been created
 		if (masterGameModeArea.data != NULL && replicaGameModeAreas.size() == (gameModeMacs.size() - 1)) {
@@ -6311,7 +4474,7 @@ static int sceNetAdhocGameModeUpdateMaster(MIPSState *mips) {
 			gma.dataSent = 0;
 	}
 
-	hleEatMicro(100);
+	hleEatMicro(80);
 	return 0;
 }
 
@@ -6390,7 +4553,7 @@ static int sceNetAdhocGameModeUpdateReplica(MIPSState *mips, int id, u32 infoAdd
 		}
 	}
 
-	hleEatMicro(100);
+	hleEatMicro(9);
 	return hleLogDebug(Log::sceNet, 0);
 }
 
@@ -6451,8 +4614,9 @@ void __NetTriggerCallbacks()
 		args[1] = error;
 		u64 now = (u64)(time_now_d() * 1000000.0);
 
-		// FIXME: When Joining a group, Do we need to wait for group creator's peer data before triggering the callback to make sure the game not to thinks we're the group creator?
-		if ((flags != ADHOCCTL_EVENT_CONNECT && flags != ADHOCCTL_EVENT_GAME) || adhocConnectionType != ADHOC_JOIN || getActivePeerCount() > 0 || static_cast<s64>(now - adhocctlStartTime) > adhocDefaultTimeout)
+		// A PSP delivers CONNECT after a Join before the host shows up in its peer list (pspautotests
+		// net/adhoc/pair/timing), so only GAME waits for a peer here.
+		if (flags != ADHOCCTL_EVENT_GAME || adhocConnectionType != ADHOC_JOIN || getActivePeerCount() > 0 || static_cast<s64>(now - adhocctlStartTime) > adhocDefaultTimeout)
 		{
 			// Since 0 is a valid index to types_ we use -1 to detects if it was loaded from an old save state
 			if (actionAfterAdhocMipsCall < 0) {
@@ -6476,11 +4640,12 @@ void __NetTriggerCallbacks()
 			case ADHOCCTL_EVENT_GAME:
 			{
 				newState = ADHOCCTL_STATE_GAMEMODE;
-				delayus = adhocEventDelay;
-				// TODO: Use blocking PTP connection to sync the timing just like official prx did (which is done before notifying user-defined Adhocctl Handlers)
-				// Workaround: Extra delay to prevent Joining player to progress faster than the Creator on Pocket Pool, but unbalanced delays could cause an issue on Shaun White Snowboarding :(
-				if (adhocConnectionType == ADHOC_JOIN)
-					delayus += adhocExtraDelay * 3;
+				delayus = RemainingEventDelayUs(flags);
+				// This is raised when the last member has arrived. The host's GAMEMODE also comes no sooner than
+				// 1.35 s after that, as the member's own does. A member doesn't know when the host called
+				// CreateEnterGameMode, so if it joins early it gets GAMEMODE before the host does.
+				if (adhocConnectionType != ADHOC_JOIN)
+					delayus = std::max(delayus, 1350000);
 				// Shows player list
 				INFO_LOG(Log::sceNet, "GameMode - All players have joined:");
 				int i = 0;
@@ -6569,7 +4734,7 @@ int NetAdhocctl_ExitGameMode() {
 
 	adhocctlCurrentMode = ADHOCCTL_MODE_NONE;
 	netAdhocGameModeEntered = false;
-	return NetAdhocctl_Disconnect();
+	return NetAdhocctl_Disconnect(true);
 }
 
 static int sceNetAdhocctlExitGameMode(MIPSState *mips) {
@@ -6697,8 +4862,8 @@ static int sceNetAdhocctlGetPeerList(MIPSState *mips, u32 sizeAddr, u32 bufAddr)
 			// Multithreading Unlock
 			peerlock.unlock();
 
-			// Return Success
-			return hleDelayResult(0, "delay 100 ~ 1000us", 100); // seems to have different thread running within the delay duration
+			hleEatMicro(4);
+			return 0;
 		}
 
 		// Invalid Arguments

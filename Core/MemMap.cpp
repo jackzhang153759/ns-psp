@@ -399,7 +399,32 @@ bool MemoryMap_Setup(MemMapSetupFlags flags) {
 	}
 
 	// Should return true...
-	return Memory_TryBase(flags);
+	if (Memory_TryBase(flags)) {
+		return true;
+	}
+
+#if PPSSPP_PLATFORM(SWITCH)
+	// Switch 特有问题：virtmemFindAslr 每次给出随机布局，而所有视图必须精确落在本 arena
+	// 本轮保留的 [memoryBase, memoryBase+PSP_ADDRESS_SPACE_SIZE) 内，否则内核会拒绝
+	// svcMapProcessMemory（日志里的 err 0xDC01 / 0xD401，即 KernelError_InvalidMemoryState）。
+	// LoadExec 在同一进程里反复重建内存（XMB->游戏->子游戏、换盘）时，base 有时仍带着上一轮的
+	// 保留地址，于是每个视图都映射失败，表现为 "init memory failed"，重进游戏才能恢复。
+	// 这里自动释放并以全新布局重试数次，等价于"自动重进".
+	for (int attempt = 1; attempt <= 3; attempt++) {
+		WARN_LOG(Log::MemMap, "Switch: memory map failed, retrying with a fresh layout (%d/3)", attempt);
+		g_arena.ReleaseSpace();
+		base = g_arena.Find4GBBase();
+		if (!base) {
+			continue;
+		}
+		if (Memory_TryBase(flags)) {
+			INFO_LOG(Log::MemMap, "Switch: memory map succeeded on retry %d", attempt);
+			return true;
+		}
+	}
+	ERROR_LOG(Log::MemMap, "Switch: memory map failed after 3 retries");
+#endif
+	return false;
 }
 
 void MemoryMap_Shutdown() {

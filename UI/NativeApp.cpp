@@ -65,6 +65,7 @@
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/thin3d.h"
 #include "Common/GPU/Vulkan/FixedSPIRVCache.h"
+#include "Common/GPU/Vulkan/VulkanLoader.h"
 #include "Common/UI/UI.h"
 #include "Common/UI/Screen.h"
 #include "Common/UI/ScreenManager.h"
@@ -91,6 +92,9 @@
 #include "Common/File/VFS/DirectoryReader.h"
 #include "Common/CPUDetect.h"
 #include "Common/File/FileUtil.h"
+#include "Common/SwitchAppRoot.h"
+#include "Core/Util/PSARUnpack.h"
+#include "SDL/SDLMain.h"
 #include "Common/TimeUtil.h"
 #include "Common/StringUtils.h"
 #include "Common/Log/LogManager.h"
@@ -539,6 +543,16 @@ static void CheckFailedGPUBackends() {
 		g_Config.sFailedGPUBackends.clear();
 		File::Delete(failedBackendsFile, true);
 	}
+	// The list above only explains *why* the backend got stuck: a past Vulkan failure dropped it to
+	// OpenGL and that choice was saved. Restore the default once. The flag makes this a single
+	// migration, so a user who deliberately picks OpenGL afterwards keeps it.
+	if (!g_Config.bBackendMigratedToVulkan) {
+		g_Config.bBackendMigratedToVulkan = true;
+		if (g_Config.iGPUBackend == (int)GPUBackend::OPENGL && VulkanMayBeAvailable()) {
+			printf("[backend] one-time migration: restoring the default backend (Vulkan)\n");
+			g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
+		}
+	}
 #endif
 
 	// Use this if you want to debug a graphics crash...
@@ -775,6 +789,14 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 	cmdLineOptions.ApplyToConfig();
 	g_cmdLineOptions = cmdLineOptions;
 
+#if PPSSPP_PLATFORM(SWITCH)
+	// The log-file decision is made here, and only here, for real: the early ini peek in main()
+	// was a best-effort guess that has missed twice when the memstick location changed. From this
+	// point the config is loaded, so the switch is applied authoritatively - and its state is
+	// shown on screen, so a missing log file is never a mystery again.
+	SwitchApplyLogFileSetting(g_Config.bEnableLogFile);
+#endif
+
 	// A debugger client drives the app from a script, and the logo only gets in its way.
 	if (cmdLineOptions.skipLogo.value_or(false) || cmdLineOptions.DebuggerPort().has_value()) {
 		skipLogo = true;
@@ -782,8 +804,71 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 
 	boot_filename.clear();
 	if (boot_filename.empty() && cmdLineOptions.bootVSH.value_or(false)) {
-		boot_filename = g_Config.nandRootDirectory / "flash0/vsh/module/vshmain.prx";
-		skipLogo = true;
+		const Path vshMain = g_Config.nandRootDirectory / "flash0/vsh/module/vshmain.prx";
+		if (File::Exists(vshMain)) {
+			boot_filename = vshMain;
+			skipLogo = true;
+		} else {
+			// No PSP firmware installed (an XMB shortcut always passes --vsh). Look for an official
+			// 6.60 updater package next to the NRO and install it automatically, so the shortcut
+			// works out of the box: install -> delete the package -> boot the XMB. If there is no
+			// package either, fall back to the normal menu.
+			Path updater;
+			for (const char *candidateName : {"660.PBP", "EBOOT.PBP"}) {
+				const Path candidate = Path(SwitchAppRoot()) / candidateName;
+				if (File::Exists(candidate)) {
+					updater = candidate;
+					break;
+				}
+			}
+			if (!updater.empty()) {
+				INFO_LOG(Log::Loader, "Boot VSH without firmware: installing the updater package %s", updater.c_str());
+				g_OSD.Show(OSDType::MESSAGE_INFO,
+					"Installing PSP firmware from " + updater.GetFilename() + " - this takes a minute or two, please wait",
+					0.0f, "fw_install");
+
+				PSARUnpackOptions options;
+				options.model = EmulatedModelGeneration();
+				// The unpack runs synchronously here, before any screen exists; put the progress
+				// into the log (which the authoritative log switch has already enabled by now).
+				int lastLoggedPercent = -10;
+				options.progress = [&lastLoggedPercent](float progress) {
+					const int percent = (int)(progress * 100.0f);
+					if (percent >= lastLoggedPercent + 10) {
+						lastLoggedPercent = percent;
+						INFO_LOG(Log::Loader, "[firmware] installing... %d%%", percent);
+					}
+				};
+				PSARUnpackStats stats;
+				std::string error;
+				const bool installed = InstallFirmware(updater, GetSysDirectory(DIRECTORY_NAND), options, &stats, &error);
+				if (installed) {
+					INFO_LOG(Log::Loader, "Firmware %s installed: %d files written (flash0/flash1)",
+						stats.firmwareVersion.c_str(), stats.written);
+					// Success only: remove the package so the directory stays clean. A failed
+					// install keeps it for a retry.
+					if (File::Delete(updater)) {
+						INFO_LOG(Log::Loader, "Deleted the installer package %s", updater.c_str());
+					} else {
+						WARN_LOG(Log::Loader, "Could not delete the installer package %s - remove it manually", updater.c_str());
+					}
+					boot_filename = vshMain;
+					skipLogo = true;
+					g_OSD.Show(OSDType::MESSAGE_INFO, "PSP firmware installed - starting the XMB", 6.0f, "fw_install");
+				} else {
+					// Keep the package: the user can drop it somewhere else or we can retry later.
+					ERROR_LOG(Log::Loader, "Firmware install failed: %s - starting the normal menu instead (the package %s was kept for a retry)",
+						error.c_str(), updater.c_str());
+					g_OSD.Show(OSDType::MESSAGE_ERROR,
+						"Firmware install failed: " + error + " - starting the main menu (the package was kept for a retry)",
+						0.0f, "fw_install");
+				}
+			} else {
+				// No PSP firmware and no updater package: boot the normal menu instead of failing to
+				// load vshmain.prx and showing a black screen.
+				WARN_LOG(Log::Loader, "Boot VSH requested but flash0/vsh/module/vshmain.prx is missing and no 660.PBP/EBOOT.PBP was found next to the NRO - falling back to the normal menu");
+			}
+		}
 	}
 	boot_mountIso = cmdLineOptions.mountIso.has_value() ? Path(cmdLineOptions.mountIso.value()) : Path();
 

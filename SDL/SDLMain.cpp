@@ -1,4 +1,9 @@
 
+// Must come before any system header: fopencookie() is a GNU extension, and newlib's features.h
+// derives __GNU_VISIBLE from _GNU_SOURCE (it overwrites a direct __GNU_VISIBLE define). Only this
+// translation unit needs it, for the timestamped log stream.
+#define _GNU_SOURCE 1
+
 #include <cstdlib>
 #include <unistd.h>
 #include <pwd.h>
@@ -41,6 +46,10 @@ SDLJoystick *joystick = NULL;
 #include "Common/Data/Format/PNGLoad.h"
 #include "Common/Net/Resolve.h"
 #include "Common/File/FileUtil.h"
+#include "Common/File/DirListing.h"
+#include "Common/System/OSD.h"
+#include "SDL/SDLMain.h"
+#include "Common/SwitchAppRoot.h"
 #include "NKCodeFromSDL.h"
 #include "Common/Math/math_util.h"
 #include "Common/GPU/OpenGL/GLRenderManager.h"
@@ -91,6 +100,13 @@ SDLJoystick *joystick = NULL;
 
 #if PPSSPP_PLATFORM(SWITCH)
 #include <switch.h>
+#include <switch/services/apm.h>
+#include <switch/services/time.h>
+#include <cerrno>
+#include <cctype>
+#include <cstring>
+#include <mutex>
+#include <switch/services/pcv.h>
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
 #include "UI/SwitchLibrary.h"
 #include "UI/SwitchUpdate.h"
@@ -159,6 +175,80 @@ extern "C" void __nx_win_init() {
 	}
 }
 
+#if PPSSPP_PLATFORM(SWITCH)
+// The port never asked for a performance configuration, so the console stayed on whatever the system
+// picked and the CPU sat around 1.7GHz while the emulator wanted more.
+//
+// The values below are not invented: libnx's apm.h documents 0x92220009 (docked) and 0x9222000A
+// (handheld) for ApmCpuBoostMode_FastLoad - "boost the CPU, throttle the GPU to minimum" - and
+// 0x00010000 is the baseline configuration stock titles report. We try them in that order and keep
+// the first the kernel accepts, logging every rc. If the console refuses all of them we stay on the
+// system default, which is exactly the situation before this change, so nothing can get worse.
+// Values outside the official table (what sys-clk is for) are deliberately not attempted: the
+// kernel rejects them.
+static ApmPerformanceMode g_apmMode = ApmPerformanceMode_Invalid;
+static u32 g_apmConfig = 0;
+
+static void SwitchRequestMaxPerformance() {
+	const Result initRc = apmInitialize();  // no-op when applet already initialised it
+	if (R_FAILED(initRc)) {
+		printf("[perf] apmInitialize rc=0x%x (continuing)\n", initRc);
+	}
+
+	// 0x92220009/0x0A = FastLoad boost (CPU 1785, GPU min) - some consoles/CFW reject them.
+	// 0x00020000 = CPU 1785MHz / GPU 768MHz / MEM 1600MHz (official table).
+	// 0x00010000 = CPU 1224MHz / GPU 384MHz / MEM 1600MHz (safe fallback).
+	static const u32 candidates[] = { 0x92220009, 0x9222000A, 0x00020000, 0x00010000 };
+	Result lastRc = initRc;
+	for (size_t i = 0; i < ARRAY_SIZE(candidates) && !g_apmConfig; i++) {
+		lastRc = apmSetPerformanceConfiguration(ApmPerformanceMode_Boost, candidates[i]);
+		printf("[perf] apm boost config=0x%08x rc=0x%x\n", candidates[i], lastRc);
+		if (R_SUCCEEDED(lastRc)) {
+			g_apmMode = ApmPerformanceMode_Boost;
+			g_apmConfig = candidates[i];
+		}
+	}
+	if (!g_apmConfig) {
+		// Boost is refused in some contexts (e.g. applet mode); the same table entries are accepted
+		// in Normal mode there, so retry once before giving up.
+		for (size_t i = 0; i < ARRAY_SIZE(candidates) && !g_apmConfig; i++) {
+			lastRc = apmSetPerformanceConfiguration(ApmPerformanceMode_Normal, candidates[i]);
+			printf("[perf] apm normal config=0x%08x rc=0x%x\n", candidates[i], lastRc);
+			if (R_SUCCEEDED(lastRc)) {
+				g_apmMode = ApmPerformanceMode_Normal;
+				g_apmConfig = candidates[i];
+			}
+		}
+	}
+
+	// Read back what the console actually took, so one log line answers "did it stick".
+	u32 appliedConfig = 0;
+	if (g_apmMode != ApmPerformanceMode_Invalid) {
+		apmGetPerformanceConfiguration(g_apmMode, &appliedConfig);
+	}
+	u32 cpuHz = 0;
+	if (R_SUCCEEDED(pcvInitialize())) {
+		pcvGetClockRate(PcvModule_CpuBus, &cpuHz);
+		pcvExit();
+	}
+	printf("[perf] apm set rc=0x%x config=0x%08x mode=%d cpu=%u kHz\n",
+		lastRc, appliedConfig, (int)g_apmMode, cpuHz / 1000);
+}
+
+static void SwitchReleasePerformance() {
+	if (g_apmMode == ApmPerformanceMode_Invalid) {
+		return;
+	}
+	const Result rc = apmSetPerformanceConfiguration(ApmPerformanceMode_Normal, 0);
+	printf("[perf] apm restore rc=0x%x\n", rc);
+	g_apmMode = ApmPerformanceMode_Invalid;
+	g_apmConfig = 0;
+	// Deliberately no apmExit(): libnx's appletExit() already closes apm when the applet is of type
+	// Application, and closing a service twice during teardown is exactly the class of bug this port
+	// has been fighting at exit. Leaving it open until process exit is harmless.
+}
+#endif  // PPSSPP_PLATFORM(SWITCH)
+
 extern "C" void __nx_win_exit() {
 	// libnx calls this from __appExit(), i.e. from exit() once main() has returned and the
 	// C++ static destructors have run - it is the very last thing this process does with the
@@ -177,6 +267,7 @@ extern "C" void __nx_win_exit() {
 	nxWinExitDone = true;
 
 	printf("[exit] __nx_win_exit: enter\n");
+	SwitchReleasePerformance();
 	nwindowClose(&g_switchWindow);
 	printf("[exit] __nx_win_exit: nwindowClose done\n");
 	const Result closeLayerResult = viCloseLayer(&g_switchLayer);
@@ -253,7 +344,11 @@ static bool g_RestartRequested = false;
 #if PPSSPP_PLATFORM(SWITCH)
 static std::string g_restartParams;
 static std::string g_switchExecutablePath;
-static constexpr const char *SWITCH_RESTART_HANDOFF = "/switch/ppsspp-nx/.restart";
+// Restart handoff lives in the data root (next to the NRO), not a fixed directory: the file has to
+// survive a process restart, and the root is the one path we know stays ours.
+static std::string SwitchRestartHandoffPath() {
+	return SwitchAppRoot() + ".restart";
+}
 
 static bool SwitchIsAppletMode() {
 	uint64_t isApplication = 1;
@@ -265,27 +360,27 @@ static bool SwitchIsAppletMode() {
 }
 
 static bool SwitchWriteRestartHandoff(std::string_view params) {
-	FILE *file = fopen(SWITCH_RESTART_HANDOFF, "wb");
+	FILE *file = fopen(SwitchRestartHandoffPath().c_str(), "wb");
 	if (!file) {
 		return false;
 	}
 	bool success = fwrite(params.data(), 1, params.size(), file) == params.size();
 	success = fclose(file) == 0 && success;
 	if (!success) {
-		remove(SWITCH_RESTART_HANDOFF);
+		remove(SwitchRestartHandoffPath().c_str());
 	}
 	return success;
 }
 
 static std::string SwitchTakeRestartHandoff() {
-	FILE *file = fopen(SWITCH_RESTART_HANDOFF, "rb");
+	FILE *file = fopen(SwitchRestartHandoffPath().c_str(), "rb");
 	if (!file) {
 		return {};
 	}
 	char buffer[512]{};
 	size_t size = fread(buffer, 1, sizeof(buffer) - 1, file);
 	fclose(file);
-	remove(SWITCH_RESTART_HANDOFF);
+	remove(SwitchRestartHandoffPath().c_str());
 	return std::string(buffer, size);
 }
 
@@ -300,6 +395,48 @@ static std::string SwitchNormalizeNroPath(std::string path) {
 		return "sdmc:/" + path;
 	}
 	return {};
+}
+
+// Reads one boolean out of ppsspp.ini without loading the whole config: this runs in main()
+// before g_Config exists, and only needs to know whether file logging was switched on last time.
+// Anything we cannot parse counts as "off" - the log file is opt-in, so failing closed is right.
+static bool SwitchReadBoolSettingFromIni(const std::string &iniPath, const char *key) {
+	FILE *file = fopen(iniPath.c_str(), "rb");
+	if (!file) {
+		return false;
+	}
+	const size_t keyLen = strlen(key);
+	bool enabled = false;
+	char line[512];
+	while (fgets(line, sizeof(line), file)) {
+		const char *p = line;
+		while (*p == ' ' || *p == '\t') {
+			++p;
+		}
+		// Case-insensitive prefix match on the key, then require "=".
+		size_t i = 0;
+		while (i < keyLen && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)key[i])) {
+			++i;
+		}
+		if (i != keyLen) {
+			continue;
+		}
+		p += keyLen;
+		while (*p == ' ' || *p == '\t') {
+			++p;
+		}
+		if (*p != '=') {
+			continue;
+		}
+		++p;
+		while (*p == ' ' || *p == '\t') {
+			++p;
+		}
+		enabled = !strncasecmp(p, "true", 4) || *p == '1' || !strncasecmp(p, "yes", 3);
+		break;
+	}
+	fclose(file);
+	return enabled;
 }
 
 static void CheckSwitchOperationMode() {
@@ -2298,33 +2435,347 @@ void UpdateSDLCursor() {
 #ifdef _WIN32
 #undef main
 #endif
+
+#if PPSSPP_PLATFORM(SWITCH)
+// ---- Timestamped logging ---------------------------------------------------------------
+// The log file is append-mode, so without a timestamp there is no telling which launch a block of
+// output belongs to. Two layers:
+//  1. The "new launch" separator carries the wall-clock date, taken from the time service.
+//  2. Every completed line is prefixed with [HH:MM:SS.mmm] by a cookie stream that stdout/stderr
+//     are pointed at (see main()). While the time service is not up yet - or if the console has no
+//     wall clock - the prefix degrades to [up <seconds>s] instead of lying with a wrong date.
+
+static bool g_switchLogWallClock = false;
+
+// Wall-clock date+time from the time service. False when the service is not usable yet.
+static bool SwitchGetWallClockDateTime(char *out, size_t outSize) {
+	// uint64_t (not PPSSPP's u64 macro, which maps to a different typedef) matches libnx's u64 here.
+	uint64_t posixTime = 0;
+	if (R_FAILED(timeGetCurrentTime(TimeType_UserSystemClock, &posixTime)) || posixTime == 0) {
+		return false;
+	}
+	const time_t secs = (time_t)posixTime;
+	struct tm tmLocal{};
+	if (!localtime_r(&secs, &tmLocal)) {
+		return false;
+	}
+	snprintf(out, outSize, "%04d-%02d-%02d %02d:%02d:%02d",
+		tmLocal.tm_year + 1900, tmLocal.tm_mon + 1, tmLocal.tm_mday,
+		tmLocal.tm_hour, tmLocal.tm_min, tmLocal.tm_sec);
+	return true;
+}
+
+struct SwitchLogCookie {
+	FILE *out = nullptr;
+	std::mutex *lock = nullptr;
+	bool wallClock = false;
+	char pending[512] = {};
+	size_t pendingLen = 0;
+};
+
+static void SwitchLogLineStamp(const SwitchLogCookie &c, char *out, size_t outSize) {
+	struct timespec ts{};
+	if (c.wallClock && clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+		const time_t secs = (time_t)ts.tv_sec;
+		struct tm tmLocal{};
+		if (localtime_r(&secs, &tmLocal)) {
+			snprintf(out, outSize, "[%02d:%02d:%02d.%03d]", tmLocal.tm_hour, tmLocal.tm_min,
+				tmLocal.tm_sec, (int)(ts.tv_nsec / 1000000));
+			return;
+		}
+	}
+	// No wall clock: fall back to uptime, clearly marked so it cannot be mistaken for a date.
+	struct timespec mono{};
+	clock_gettime(CLOCK_MONOTONIC, &mono);
+	snprintf(out, outSize, "[up %lld.%03llds]", (long long)mono.tv_sec, (long long)(mono.tv_nsec / 1000000));
+}
+
+// Writes one buffered line with its timestamp. Caller holds the lock.
+static void SwitchLogFlushPending(SwitchLogCookie &c) {
+	if (c.out && c.pendingLen) {
+		char stamp[40];
+		SwitchLogLineStamp(c, stamp, sizeof(stamp));
+		fprintf(c.out, "%s %.*s", stamp, (int)c.pendingLen, c.pending);
+		fflush(c.out);
+	}
+	c.pendingLen = 0;
+}
+
+static ssize_t SwitchLogCookieWrite(void *cookie, const char *buf, size_t size) {
+	SwitchLogCookie &c = *(SwitchLogCookie *)cookie;
+	if (!c.out) {
+		return (ssize_t)size;  // target already closed - drop quietly
+	}
+	std::lock_guard<std::mutex> guard(*c.lock);
+	size_t start = 0;
+	while (start < size) {
+		const char *newline = (const char *)memchr(buf + start, '\n', size - start);
+		const size_t chunkLen = newline ? (size_t)(newline - (buf + start) + 1) : (size - start);
+		if (c.pendingLen + chunkLen >= sizeof(c.pending)) {
+			// Would overflow: emit what is buffered as its own line and continue. Over-long lines
+			// come out split, which is acceptable for a diagnostic log.
+			if (c.pendingLen) {
+				SwitchLogFlushPending(c);
+			} else {
+				fwrite(buf + start, 1, chunkLen - (newline ? 1 : 0), c.out);
+				fputc('\n', c.out);
+				start += chunkLen;
+				continue;
+			}
+		}
+		memcpy(c.pending + c.pendingLen, buf + start, chunkLen);
+		c.pendingLen += chunkLen;
+		start += chunkLen;
+		if (newline) {
+			SwitchLogFlushPending(c);
+		}
+	}
+	return (ssize_t)size;
+}
+
+// Only flushes: newlib flushes stdout/stderr during exit but does not close them, and both streams
+// share this cookie, so freeing anything here would be a use-after-free at best.
+static int SwitchLogCookieClose(void *cookie) {
+	SwitchLogCookie &c = *(SwitchLogCookie *)cookie;
+	if (c.out && c.pendingLen) {
+		std::lock_guard<std::mutex> guard(*c.lock);
+		SwitchLogFlushPending(c);
+	}
+	return 0;
+}
+
+// Opens the log file and points stdout/stderr at a timestamping cookie stream over it.
+// Returns false if the real file could not be opened (the console streams stay untouched then).
+// Tracks whether stdout/stderr currently point at the log (or the silenced sink). Guard both the
+// early best-effort open in main() and the authoritative open after config load against double-open.
+static bool g_logStreamOpen = false;
+
+static bool SwitchOpenTimestampedLog(const char *logPath, bool append) {
+	if (g_logStreamOpen) {
+		return true;  // already open - nothing to do, and re-opening would leak the old stream
+	}
+	FILE *out = fopen(logPath, append ? "a" : "w");
+	if (!out) {
+		return false;
+	}
+	setvbuf(out, nullptr, _IONBF, 0);
+
+	timeInitialize();  // best effort; no timeExit() - other components depend on the service
+
+	uint64_t posixTime = 0;
+	g_switchLogWallClock = R_SUCCEEDED(timeGetCurrentTime(TimeType_UserSystemClock, &posixTime)) && posixTime != 0;
+
+	// The separator keeps its own full date, independent of the per-line prefix.
+	char launchStamp[40]{};
+	if (SwitchGetWallClockDateTime(launchStamp, sizeof(launchStamp))) {
+		fprintf(out, "\n===== new launch [%s] =====\n", launchStamp);
+	} else {
+		fprintf(out, "\n===== new launch =====\n");
+	}
+	fflush(out);
+
+	static std::mutex s_switchLogLock;  // shared by both stdout and stderr views
+	static SwitchLogCookie *s_cookie = nullptr;
+	if (!s_cookie) {
+		s_cookie = new SwitchLogCookie();
+		s_cookie->lock = &s_switchLogLock;
+	}
+	s_cookie->out = out;
+	s_cookie->wallClock = g_switchLogWallClock;
+
+	cookie_io_functions_t io{};
+	io.write = SwitchLogCookieWrite;
+	io.close = SwitchLogCookieClose;
+	FILE *stream = fopencookie(s_cookie, "w", io);
+	if (!stream) {
+		// Cookie streams unavailable on this toolchain: plain redirection, no prefixes.
+		WARN_LOG(Log::System, "fopencookie failed - log keeps working without timestamps");
+		stdout = out;
+		stderr = out;
+		g_logStreamOpen = true;
+		return true;
+	}
+	setvbuf(stream, nullptr, _IONBF, 0);  // our callback buffers per line already
+	stdout = stream;
+	stderr = stream;
+	g_logStreamOpen = true;
+	INFO_LOG(Log::System, "Log stream opened with timestamps (wall clock: %s)",
+		g_switchLogWallClock ? "yes" : "no (uptime prefix)");
+	return true;
+}
+// One-time migration: a legacy install kept everything under /switch/ppsspp-nx/, while the data
+// root now follows the NRO. Move the PSP directory over exactly once - rename is instant when both
+// sides are on the same SD partition, which is the normal case. The old directory itself is kept
+// (it may hold things the user put there), only PSP is moved; cache/ and lsfg/ are caches and are
+// rebuilt at the new location.
+static void SwitchCopyDirectoryTree(const Path &from, const Path &to) {
+	File::CreateFullPath(to);
+	std::vector<File::FileInfo> entries;
+	if (!File::GetFilesInDir(from, &entries, nullptr, File::GETFILES_GETHIDDEN)) {
+		return;
+	}
+	for (const File::FileInfo &entry : entries) {
+		if (entry.isDirectory) {
+			SwitchCopyDirectoryTree(entry.fullName, to / entry.name);
+		} else if (!File::Copy(entry.fullName, to / entry.name)) {
+			WARN_LOG(Log::System, "[migrate] failed to copy %s", entry.fullName.c_str());
+		}
+	}
+}
+
+static void SwitchMigrateLegacyData() {
+	const std::string &root = SwitchAppRoot();
+	if (root == "/switch/ppsspp-nx/") {
+		return;  // data is already where it belongs
+	}
+	const std::string legacyPsp = "/switch/ppsspp-nx/PSP";
+	const std::string newPsp = root + "PSP";
+	// Already migrated (or a fresh install that wrote its own config) - never move again.
+	if (File::Exists(Path(newPsp) / "SYSTEM" / "ppsspp.ini")) {
+		return;
+	}
+	if (!File::Exists(Path(legacyPsp))) {
+		return;  // nothing to migrate
+	}
+	File::CreateDir(Path(root.substr(0, root.size() - 1)));
+	// Same device (both on the SD card): rename is instant and atomic.
+	if (rename(legacyPsp.c_str(), newPsp.c_str()) == 0) {
+		printf("[migrate] moved /switch/ppsspp-nx/PSP -> %sPSP\n", root.c_str());
+		return;
+	}
+	// Cross-device or blocked by something: copy instead, keeping the old directory in place.
+	// The PSP directory can hold a lot of save data, so warn that this may take a while.
+	WARN_LOG(Log::System, "[migrate] rename failed (%s), copying instead - this can take a while", strerror(errno));
+	SwitchCopyDirectoryTree(Path(legacyPsp), Path(newPsp));
+	printf("[migrate] copied /switch/ppsspp-nx/PSP -> %sPSP\n", root.c_str());
+}
+// Library: the game browser's default games directory and its own config follow the new root too.
+//
+// The games directory can hold tens of GB, so it is rename-only: if the rename cannot be done
+// (cross-device, something holding the directory) it is left exactly where it is and the log says
+// so - silently copying that much data on every boot would be far worse than a one-time hint.
+static void SwitchMigrateLegacyLibrary() {
+	const std::string &root = SwitchAppRoot();
+	if (root == "/switch/ppsspp-nx/") {
+		return;  // data is already where it belongs
+	}
+	const Path legacyGames("/switch/ppsspp-nx/games");
+	const Path newGames = Path(root) / "games";
+	if (File::IsDirectory(legacyGames) && !File::Exists(newGames)) {
+		if (rename(legacyGames.c_str(), newGames.c_str()) == 0) {
+			printf("[migrate] moved /switch/ppsspp-nx/games -> %sgames\n", root.c_str());
+		} else {
+			WARN_LOG(Log::System, "[migrate] could not move /switch/ppsspp-nx/games (%s) - it stays there; move it to %sgames manually if wanted", strerror(errno), root.c_str());
+		}
+	}
+	const Path legacyIni("/switch/ppsspp-nx/library.ini");
+	const Path newIni = Path(root) / "library.ini";
+	if (File::Exists(legacyIni) && !File::Exists(newIni)) {
+		if (rename(legacyIni.c_str(), newIni.c_str()) == 0) {
+			printf("[migrate] moved /switch/ppsspp-nx/library.ini -> %slibrary.ini\n", root.c_str());
+		} else if (File::Copy(legacyIni, newIni)) {
+			// Tiny file: copying is a fine fallback.
+			printf("[migrate] copied /switch/ppsspp-nx/library.ini -> %slibrary.ini\n", root.c_str());
+		} else {
+			WARN_LOG(Log::System, "[migrate] could not move library.ini (%s)", strerror(errno));
+		}
+	}
+}
+// Turns the log stream off without closing anything: stdout/stderr move to a drop-everything
+// cookie stream. (/dev/null does not exist on Horizon, and fclose()ing stdout mid-run is a
+// use-after-free trap for anything that still prints.) The cookie machinery already drops writes
+// when its FILE* is unset, so this reuses it as-is.
+static void SwitchSilenceLogStream() {
+	static std::mutex s_nullLock;
+	static SwitchLogCookie s_nullCookie{nullptr, &s_nullLock};
+	cookie_io_functions_t io{};
+	io.write = SwitchLogCookieWrite;
+	io.close = SwitchLogCookieClose;
+	FILE *sink = fopencookie(&s_nullCookie, "w", io);
+	if (sink) {
+		setvbuf(sink, nullptr, _IONBF, 0);
+		stdout = sink;
+		stderr = sink;
+	}
+	g_logStreamOpen = false;
+}
+
+void SwitchApplyLogFileSetting(bool enabled) {
+	if (enabled && !g_logStreamOpen) {
+		// The early ini guess missed (memstick moved, ini not written yet, ...) - open now, append,
+		// so whatever was logged earlier in this run is preserved.
+		if (SwitchOpenTimestampedLog("sdmc:/ppsspp_log.txt", true)) {
+			printf("[log] authoritative open after config load\n");
+		} else {
+			WARN_LOG(Log::System, "authoritative log open failed - sdmc:/ppsspp_log.txt not writable");
+		}
+	} else if (!enabled && g_logStreamOpen) {
+		// Config says off but the early guess opened it: silence the stream.
+		SwitchSilenceLogStream();
+		printf("[log] authoritative close after config load (LogFile=false, early guess was on)\n");
+	}
+	// Shown on screen only when logging is actually on: when it is off there is nothing to look
+	// for, and a constant "off" toast on every start is just noise. Chinese, matching this
+	// build's audience (drawn through the same SDL3_ttf + Noto pipeline as the rest of the UI).
+	if (enabled) {
+		g_OSD.Show(OSDType::MESSAGE_INFO, "日志文件正在记录", 5.0f, "log_file_state");
+	}
+}
+#endif  // PPSSPP_PLATFORM(SWITCH)
+
 int main(int argc, char *argv[]) {
 	TimeInit();
 
 #if PPSSPP_PLATFORM(SWITCH)
+	// The data root follows the NRO's directory, and a legacy install's PSP directory is moved over
+	// once. This has to happen before anything reads or writes under the root - including the log
+	// gate below, which reads the ini that the migration may just have moved.
+	SwitchSetAppRootFromNro(argc > 0 && argv[0] ? SwitchNormalizeNroPath(argv[0]) : std::string());
+	SwitchMigrateLegacyData();
+	SwitchMigrateLegacyLibrary();
+
 	// Graphics-backend selection failures are invisible on hardware otherwise, so mirror
 	// stdout/stderr to the SD card root. Overwrites on each launch.
 	// Append across launches so several runs (e.g. launching a game from the PPSSPP
 	// menu vs. from the XMB's UMD slot) can be compared in one file. Reset once it
 	// grows past 512 KB so it never fills the SD card.
 	{
-		const char *logPath = "sdmc:/ppsspp_log.txt";
-		bool append = false;
-		if (FILE *existing = fopen(logPath, "rb")) {
-			fseek(existing, 0, SEEK_END);
-			const long size = ftell(existing);
-			fclose(existing);
-			append = size > 0 && size < 512 * 1024;
+		// Opt-in: Settings > Tools > "Generate log file" (ppsspp.ini: LogFile = True). A release
+		// build should not create files on the SD card unless the user asked for it.
+		// The ini is looked for in two places: the migrated data root (next to the NRO) first, then
+		// the legacy hardcoded location for installs that have not been migrated yet. Either being
+		// set to true turns logging on.
+		const std::string rootIniPath = SwitchAppRoot() + "PSP/SYSTEM/ppsspp.ini";
+		const char *fixedIniPath = "/switch/ppsspp-nx/PSP/SYSTEM/ppsspp.ini";
+		// Escape hatch: if the app dies before the settings screen can be reached, the LogFile
+		// switch is useless - the user can never turn it on. An empty marker file in the SD card
+		// root forces logging on, so a shared build stays quiet while whoever hits a problem can
+		// still produce a log without touching the menu.
+		const bool debugMarker = File::Exists(Path("sdmc:/ppsspp_debug.txt"));
+		const bool iniEnabled = SwitchReadBoolSettingFromIni(fixedIniPath, "LogFile")
+			|| SwitchReadBoolSettingFromIni(rootIniPath.c_str(), "LogFile");
+		// Marker file wins: it exists precisely because the ini route was not usable.
+		const bool logFileEnabled = debugMarker || iniEnabled;
+		if (debugMarker) {
+			printf("[log] file logging forced by sdmc:/ppsspp_debug.txt\n");
+		} else {
+			printf("[log] file logging %s (LogFile '%s' in '%s' or '%s')\n",
+				logFileEnabled ? "enabled" : "disabled", logFileEnabled ? "LogFile=True" : "LogFile not set",
+				fixedIniPath, rootIniPath.c_str());
 		}
-		if (freopen(logPath, append ? "a" : "w", stdout)) {
-			setvbuf(stdout, nullptr, _IONBF, 0);
-			if (append) {
-				printf("\n===== new launch =====\n");
+		if (logFileEnabled) {
+			const char *logPath = "sdmc:/ppsspp_log.txt";
+			bool append = false;
+			if (FILE *existing = fopen(logPath, "rb")) {
+				fseek(existing, 0, SEEK_END);
+				const long size = ftell(existing);
+				fclose(existing);
+				append = size > 0 && size < 512 * 1024;
+			}
+			if (!SwitchOpenTimestampedLog(logPath, append)) {
+				fprintf(stderr, "[log] failed to open %s\n", logPath);
 			}
 		}
-	}
-	if (freopen("sdmc:/ppsspp_log.txt", "a", stderr)) {
-		setvbuf(stderr, nullptr, _IONBF, 0);
 	}
 #endif
 
@@ -2363,7 +2814,8 @@ int main(int argc, char *argv[]) {
 		g_switchExecutablePath = SwitchNormalizeNroPath(argv[0]);
 	}
 	if (g_switchExecutablePath.empty()) {
-		g_switchExecutablePath = "sdmc:/switch/ppsspp-nx/PPSSPP.nro";
+		// No usable argv[0]: fall back to the NRO inside the data root.
+		g_switchExecutablePath = "sdmc:" + SwitchAppRoot() + "PPSSPP.nro";
 	}
 	SwitchUpdate_SetExecutablePath(g_switchExecutablePath);
 	std::string updateRecoveryError;
@@ -2379,6 +2831,8 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "Unable to mount RomFS.\n");
 		return 1;
 	}
+	// Ask for the highest official performance configuration now that the runtime services are up.
+	SwitchRequestMaxPerformance();
 	if (R_SUCCEEDED(socketInitializeDefault())) {
 		g_socketInitialized = true;
 		g_nxlinkSocket = nxlinkStdio();
@@ -2545,7 +2999,9 @@ int main(int argc, char *argv[]) {
 	// Mac / Linux
 	char path[2048] = {};
 #if PPSSPP_PLATFORM(SWITCH)
-	strcpy(path, "/switch/ppsspp-nx/");
+	// Data root follows the NRO's directory (see SwitchAppRoot), with the historical location as
+	// the fallback when argv[0] was unusable.
+	snprintf(path, sizeof(path), "%s", SwitchAppRoot().c_str());
 #else
 	const char *the_path = getenv("HOME");
 	if (!the_path) {
@@ -2575,11 +3031,12 @@ int main(int argc, char *argv[]) {
 	NativeInit(argc, (const char **)argv, cmdLineOptions, path, external_dir, nullptr);
 
 #if PPSSPP_PLATFORM(SWITCH)
-	File::CreateFullPath(Path("/switch/ppsspp-nx/lsfg"));
+	File::CreateFullPath(Path(SwitchAppRoot() + "lsfg"));
 	SwitchLSFG_Configure(g_Config.bSwitchFrameGeneration && g_Config.iGPUBackend == (int)GPUBackend::VULKAN, 0.25f, true);
 	SwitchLibrary::Initialize();
-	File::CreateFullPath(Path("/switch/ppsspp-nx/cache/mesa"));
-	setenv("MESA_SHADER_CACHE_DIR", "/switch/ppsspp-nx/cache/mesa", 1);
+	const std::string mesaCacheDir = SwitchAppRoot() + "cache/mesa";
+	File::CreateFullPath(Path(mesaCacheDir));
+	setenv("MESA_SHADER_CACHE_DIR", mesaCacheDir.c_str(), 1);
 	setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 1);
 #endif
 
@@ -3076,7 +3533,7 @@ int main(int argc, char *argv[]) {
 		bool handoffReady = g_restartParams.empty() || SwitchWriteRestartHandoff(g_restartParams);
 		if (handoffReady && (__nx_applet_type == AppletType_Application || __nx_applet_type == AppletType_SystemApplication)) {
 			appletRestartProgram(nullptr, 0);
-			remove(SWITCH_RESTART_HANDOFF);
+			remove(SwitchRestartHandoffPath().c_str());
 		}
 		std::string restartArgs = g_switchExecutablePath;
 		if (!g_restartParams.empty()) {

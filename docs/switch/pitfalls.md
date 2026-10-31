@@ -26,9 +26,13 @@
 `-DFFMPEG_DIR` 要传 msys2 风格 `/c/...`（`C:/...` 会被当相对路径）。
 改 FFmpeg 版本后要 `-U "FFmpeg_*" -U "HAVE_LIBAVCODEC*"` 清缓存，否则残留 NOTFOUND。
 
-### A4. 不要替换 `assets/font_atlas.zim/.meta`
-预生成的字体图集，Switch 版不走 SDL3_ttf。手工用 atlastool 重生成会**启动即崩**。
-UI 缺字的正确路线是启用 SDL3_ttf + 字体回退（需交叉编 SDL3_ttf + harfbuzz）。
+### A4. `assets/font_atlas.zim/.meta` 不要手工替换 ⭐（2026-10-31 已更新）
+**现状**：Switch 版**已启用 SDL3_ttf**（`USE_SDL3_TTF`）+ `assets/fonts/NotoSansSC-Regular.otf` 回退，
+UI 中文不再依赖图集缺字。图集（UBUNTU24）仍是主字体，缺字时走 `CheckMissingGlyph` → Noto 回退。
+**仍然不要**手工用 atlastool 重生成图集：换成覆盖两万字的字体后图集高度会超
+`AtlasGen.cpp:118` 的 `maxHeight = width*2` 假设 → 真机 Vulkan 初始化成功后**立刻崩溃**。
+且 `'z'` locale 的字符过滤在实际渲染时**未生效**（原因未查明），不要重试图集扩充路线——用 TTF 回退，已解决。
+教训细节见下面 F9。原图集备份：`F:/SWITCH-psp/backup-font-atlas/font_atlas.{zim,meta}.orig`。
 
 ### A5. 触屏只有高亮、点不动 → SDL3 没打补丁
 `SDL_SendTouch` 第 5 个参数是**事件类型**不是 bool。原代码传 `true/false` = `type=0/1`，
@@ -128,7 +132,62 @@ git show HEAD:<路径>          # 与工作树对比
 
 ---
 
-## E. 快速诊断表
+## F. 2026-10-31 会话新增（UI / 数据文件 / 打包）
+
+### F1. 行尾规则：ini 保持 CRLF，金手指必须 LF；MSYS grep 会骗人 ⭐
+- **`assets/lang/zh_CN.ini` 整个文件本来就是 CRLF**（1808 行全 `\r\n`）。之前 `grep -c $'\r'` 返回 0 是
+  **MSYS/Git Bash 文本模式剥 CR 的假象** → 误判成"应该 LF"。
+- **修改 ini 时保持文件原有 CRLF 风格**，别按"必须 LF"去"修"，会制造全文件 diff。
+- **金手指 `cheat.db` 相反：必须 LF** —— PPSSPP 的 CWCheat 解析器读不了 CRLF，
+  Windows 文本模式写文件（Python `"w"`）会写坏它。合并/生成脚本一律用 **`'rb'/'wb'` 二进制模式**，
+  显式 `replace(b'\r\n', b'\n')`，并用 **Python rb 逐字节校验**（grep/diff 在 MSYS 层都会掩盖问题）。
+- 教训：**"文本文件行尾"没有统一答案，以解析器实际行为 + 文件既有风格为准，且必须用二进制方式校验。**
+
+### F2. 源码字符串编码混写 → TTF 渲染成方块字
+UI Hint 曾写成 `\u4e0b` 转义 + 原始 UTF-8 字节**混写**，取决于编译器执行字符集，
+产物里可能不是合法 UTF-8 → TextDrawerSDL 解码失败逐字节画方块。
+**中文一律直接写 UTF-8 字面量**，编译后用 `strings`/二进制搜索验证 NRO 内该串恰出现 1 次。
+
+### F3. fopencookie 两坑（日志时间戳流）
+- `#define _GNU_SOURCE 1` 必须在**所有 include 之前**；
+- PPSSPP `#define u64 _u64` 与 libnx 冲突 → cookie 回调里用 `uint64_t` 不要用 `u64`。
+
+### F4. `atlastool_bin` 会残留在仓库根目录
+编译失败时 `test -f` 仍通过 → 可能跑到**旧的**二进制得出错误结论。跑图集工具前先 `rm -f`。
+（该文件已进 .gitignore，勿提交。）
+
+### F5. nacptool 写中文作者会 GBK 乱码
+nacptool 按 ANSI 处理非 ASCII。用 `scripts/switch/patch_nacp_author.py` 构建后把作者字段改回 UTF-8。
+
+### F6. NSP forwarder 图标必须 JPEG
+NACP 图标塞 PNG 是非法文件，桌面会显示问号。`tools/make_forwarder_nsp.py` 的
+`write_icon_jpeg()` 会把任意输入归一化成 256×256 JPEG。
+
+### F7. MSYS 路径转换会毁掉 sdmc 参数
+`--sdmc /switch/...` 被 MSYS 转成 Windows 路径 → **加 `MSYS_NO_PATHCONV=1`**；
+`--args --vsh` 会被 argparse 当成选项 → 写成 **`--args=--vsh`**。
+生成器脚本里有防呆校验，但命令行直接调时自己注意。
+
+### F8. APM 性能档：0x92220009/0x0A 会被拒
+`apmSetPerformanceConfiguration` 传 boost 档 `0x92220009`/`0x9222000A` 真机返回 `rc=0x494`。
+候选列表必须包含 **`0x00020000`（1785MHz）**，逐个尝试取第一个成功的
+（见 `SDL/SDLMain.cpp` `SwitchRequestMaxPerformance()`）。
+
+### F9. 字体图集扩充实验（❌ 失败，已回滚，不要重试）
+- 请求集 ~9500 汉字 vs 原字体只覆盖 2397 → 换微软雅黑后图集涨到 2048×4146，
+  超 `AtlasGen.cpp:118` 假设 → 真机**启动即崩**（Vulkan 初始化成功之后崩，极具迷惑性）；
+- 新加 `'z'` locale + `charset_cn.txt`：`DEBUG` 显示集合正确（2599 字）但实际仍渲染 8767 字，
+  **filter 未生效原因未查明**；宽度改 4096 更糟（4096×6242）；
+- **正确路线 = SDL3_ttf + TTF 回退（已实现）**。原图集备份在 `F:/SWITCH-psp/backup-font-atlas/`。
+
+### F10. git-version.cmake describe 拿错版本
+本仓库有怪 tag `1.0.0` + shallow clone 看不到正式 tag →
+`git describe` 要加 `--match "v1.*"`，克隆时 `--unshallow`。版本号由
+`CMakeLists.txt` 的 `PPSSPP_SWITCH_RELEASE_VERSION "1.20.4"` FORCE 钉住，跟随主线手动更新。
+
+---
+
+## G. 快速诊断表
 
 | 症状 | 原因 |
 |---|---|
@@ -142,3 +201,10 @@ git show HEAD:<路径>          # 与工作树对比
 | enet 重复符号 | Switch 链了 `aemu_postoffice_server`（C2/C3） |
 | `git status` 报 0 改动但明明改了 | 子模块损坏（D1） |
 | 编译"卡住"不动、无报错 | 进程被环境杀（D2）→ 交给 worker 跑 |
+| UI 中文变问号/方块 | 字符串编码混写（F2）或动了图集（A4/F9） |
+| 金手指读不出/解析错 | cheat.db 是 CRLF（F1）或含坏 `_L` 行 |
+| 桌面快捷方式图标是问号 | NSP 图标不是 JPEG（F6） |
+| 传给 nro 的参数路径变味 | MSYS 路径转换（F7） |
+| apm boost 被拒 rc=0x494 | 候选列表缺 0x00020000（F8） |
+| ini 一改就全文件 diff | 行尾风格判断错了（F1） |
+| 版本号显示成 1.0.0 或怪版本 | describe 未加 `--match "v1.*"`（F10） |

@@ -2,6 +2,8 @@
 
 #include "lsfg_bridge.h"
 
+#include "Common/SwitchAppRoot.h"
+
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -90,7 +92,7 @@ struct LsfgNxRuntime {
             .queue = info.queue,
             .getInstanceProcAddr = info.get_instance_proc_addr,
             .pipelineCachePath = std::filesystem::path(
-                "/switch/ppsspp-nx/cache/lsfg-vk-pipeline-cache.bin")
+                SwitchAppRoot() + "cache/lsfg-vk-pipeline-cache.bin")
         };
 
         backend = std::make_unique<lsfgvk::backend::Instance>(

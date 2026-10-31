@@ -516,6 +516,10 @@ void LogoScreen::DrawForeground(UIContext &dc) {
 
 	dc.DrawText("www.ppsspp.org", bounds.centerX(), startY + 160, textColor, ALIGN_CENTER);
 
+	// Switch build credit. Chinese here needs a real font - with the bitmap atlas it would draw as
+	// question marks, which is exactly what USE_SDL3_TTF + the bundled Noto Sans SC fallback fix.
+	dc.DrawText("\xe9\xbe\x99\xe9\xad\x82\xe7\x8c\xaa\xe7\x8c\xaa\xe5\x9f\xba\xe4\xba\x8eNaGaa95\xe7\x89\x88\xe6\x9c\xac\xe4\xbf\xae\xe6\x94\xb9", bounds.centerX(), startY + 200, textColor, ALIGN_CENTER);
+
 #if !PPSSPP_PLATFORM(UWP) || defined(_DEBUG)
 	// Draw the graphics API, except on UWP where it's always D3D11
 	std::string apiName(gr->T(screenManager()->getDrawContext()->GetInfoString(InfoField::APINAME)));
@@ -524,7 +528,7 @@ void LogoScreen::DrawForeground(UIContext &dc) {
 	// Add some emoji for testing.
 	apiName += CodepointToUTF8(0x1F41B) + CodepointToUTF8(0x1F41C) + CodepointToUTF8(0x1F914);
 #endif
-	dc.DrawText(apiName, bounds.centerX(), startY + 200, textColor, ALIGN_CENTER);
+	dc.DrawText(apiName, bounds.centerX(), startY + 240, textColor, ALIGN_CENTER);
 #endif
 
 	dc.Flush();

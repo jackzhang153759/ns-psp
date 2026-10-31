@@ -4,7 +4,9 @@ set(GIT_VERSION_UPDATE "1")
 
 find_package(Git)
 if(GIT_FOUND AND EXISTS "${SOURCE_DIR}/.git/")
-	execute_process(COMMAND ${GIT_EXECUTABLE} describe --always
+	# --match "v1.*": the upstream tree also carries a bare "1.0.0" tag that is much closer
+	# than the real release tags and would otherwise win, printing a meaningless version.
+	execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --match "v1.*" --always
 		WORKING_DIRECTORY ${SOURCE_DIR}
 		RESULT_VARIABLE exit_code
 		OUTPUT_VARIABLE GIT_VERSION)
