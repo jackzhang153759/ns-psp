@@ -45,8 +45,8 @@
 
 namespace {
 
-constexpr char LATEST_RELEASE_URL[] = "https://api.github.com/repos/NaGaa95/ppsspp-nx/releases/latest";
-constexpr char RELEASE_ASSET_PREFIX[] = "https://github.com/NaGaa95/ppsspp-nx/releases/download/";
+constexpr char LATEST_RELEASE_URL[] = "https://api.github.com/repos/jackzhang153759/ns-psp/releases/latest";
+constexpr char RELEASE_ASSET_PREFIX[] = "https://github.com/jackzhang153759/ns-psp/releases/download/";
 constexpr size_t MAX_RELEASE_RESPONSE = 2 * 1024 * 1024;
 constexpr uint64_t MINIMUM_NRO_SIZE = 1024 * 1024;
 constexpr uint64_t MAXIMUM_NRO_SIZE = 512ULL * 1024 * 1024;
