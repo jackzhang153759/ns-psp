@@ -545,7 +545,9 @@ void InitLocalhostIP() {
 	g_localhostIP.in.sin_port = 0;
 
 	std::string serverStr(StripSpaces(g_Config.sProAdhocServer));
-	isLocalServer = (!strcasecmp(serverStr.c_str(), "localhost") || serverStr.find("127.") == 0);
+	// Unified check (see proAdhoc.h): recognizes the console's own IP, not just literal
+	// localhost/127.* - a server address that points back at us is a local server.
+	isLocalServer = IsLocalAdhocServerAddress(serverStr);
 }
 
 static void __ApctlState(u64 userdata, int cyclesLate) {

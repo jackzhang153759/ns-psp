@@ -391,6 +391,16 @@ if(USE_LIBNX)
 	# version into the .nacp even after this default changed.
 	set(PPSSPP_SWITCH_RELEASE_VERSION "1.20.4" CACHE STRING "PPSSPP Switch release version" FORCE)
 	add_compile_definitions(PPSSPP_SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION}")
+	# The release tag this NRO was built from - what the update checker compares the GitHub
+	# release's tag against. Kept in a one-line file so publishing a release is one edit + one
+	# commit; a clean checkout without the file falls back to the plain version above.
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/release-tag.txt")
+		file(READ "${CMAKE_CURRENT_SOURCE_DIR}/release-tag.txt" PPSSPP_SWITCH_RELEASE_TAG)
+		string(STRIP "${PPSSPP_SWITCH_RELEASE_TAG}" PPSSPP_SWITCH_RELEASE_TAG)
+	else()
+		set(PPSSPP_SWITCH_RELEASE_TAG "${PPSSPP_SWITCH_RELEASE_VERSION}")
+	endif()
+	add_compile_definitions(PPSSPP_SWITCH_RELEASE_TAG="${PPSSPP_SWITCH_RELEASE_TAG}")
 	find_path(SWITCH_CURL_INCLUDE_DIR curl/curl.h REQUIRED)
 	find_library(SWITCH_CURL_LIBRARY NAMES curl REQUIRED)
 	find_library(SWITCH_MBEDTLS_LIBRARY NAMES mbedtls REQUIRED)

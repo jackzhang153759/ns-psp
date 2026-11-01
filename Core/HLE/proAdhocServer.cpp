@@ -1661,7 +1661,8 @@ const char * strcpyxml(char * out, const char * in, uint32_t size)
  */
 // True when the configured adhoc server address resolves to this console itself: empty (the client
 // falls back to localhost), the loopback name/address, or one of the machine's own IP addresses.
-static bool IsLocalAdhocServerAddress(const std::string &server) {
+// Defined here (next to GetLocalIP4List's user) and declared in proAdhoc.h; see the comment there.
+bool IsLocalAdhocServerAddress(const std::string &server) {
 	if (server.empty()) {
 		return true;
 	}

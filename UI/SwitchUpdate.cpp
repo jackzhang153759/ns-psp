@@ -42,6 +42,9 @@
 #ifndef PPSSPP_SWITCH_RELEASE_VERSION
 #define PPSSPP_SWITCH_RELEASE_VERSION "1.0.0"
 #endif
+#ifndef PPSSPP_SWITCH_RELEASE_TAG
+#define PPSSPP_SWITCH_RELEASE_TAG PPSSPP_SWITCH_RELEASE_VERSION
+#endif
 
 namespace {
 
@@ -69,6 +72,9 @@ struct ReleaseInfo {
 	std::string tag;
 	std::string name;
 	std::string notes;
+	// The part of the release body users actually want to see: what changed in *this* build.
+	// Extracted from a <!-- changelog ... --> marker section, falling back to the body itself.
+	std::string changelog;
 	std::string assetName;
 	std::string assetUrl;
 	std::string assetDigest;
@@ -104,6 +110,47 @@ int HexDigit(char value) {
 	return -1;
 }
 
+// The release body starts with install instructions; what the update dialog should show is the
+// "what changed" part. Releases mark it with a <!-- changelog ... --> section; anything up to a
+// closing <!-- /changelog --> marker belongs to it. Without the markers the body itself is shown,
+// trimmed to a length the Switch dialog can reasonably scroll through.
+std::string ExtractChangelog(const std::string &body) {
+	auto trim = [](std::string text) {
+		size_t begin = text.find_first_not_of(" \t\r\n");
+		if (begin == std::string::npos)
+			return std::string();
+		size_t end = text.find_last_not_of(" \t\r\n");
+		return text.substr(begin, end - begin + 1);
+	};
+
+	const std::string fallback = [&]() {
+		std::string trimmed = trim(body);
+		if (trimmed.size() > 800)
+			trimmed = trimmed.substr(0, 800) + "...";
+		return trimmed.empty() ? "No changelog was provided for this release." : trimmed;
+	}();
+
+	const std::string openMarker = "<!-- changelog";
+	size_t open = body.find(openMarker);
+	if (open == std::string::npos)
+		return fallback;
+	size_t contentStart = body.find("-->", open);
+	if (contentStart == std::string::npos)
+		return fallback;
+	contentStart += 3;
+
+	size_t contentEnd = body.find("<!-- /changelog", contentStart);
+	if (contentEnd == std::string::npos)
+		contentEnd = body.size();
+
+	std::string changelog = trim(body.substr(contentStart, contentEnd - contentStart));
+	if (changelog.empty())
+		return fallback;
+	if (changelog.size() > 800)
+		changelog = changelog.substr(0, 800) + "...";
+	return changelog;
+}
+
 bool ParseRelease(const std::string &data, ReleaseInfo *release, std::string *error) {
 	json::JsonReader reader(data.data(), data.size());
 	json::JsonGet root = reader.root();
@@ -115,8 +162,9 @@ bool ParseRelease(const std::string &data, ReleaseInfo *release, std::string *er
 	root.getString("body", &release->notes);
 	if (release->name.empty())
 		release->name = release->tag;
-	if (release->notes.empty())
-		release->notes = "No changelog was provided for this release.";
+	release->changelog = ExtractChangelog(release->notes);
+	if (release->changelog.empty())
+		release->changelog = "No changelog was provided for this release.";
 
 	int bestAsset = -1;
 	const JsonNode *assets = root.getArray("assets");
@@ -327,6 +375,37 @@ bool HasDownloadSpace(const std::string &path, uint64_t size) {
 	return available >= (unsigned __int128)size + 8 * 1024 * 1024;
 }
 
+// Download sources in preference order: the raw GitHub URL, then the community ghproxy-style
+// mirrors for users whose direct GitHub connection is slow or blocked. Whichever source produced a
+// valid download once is remembered for the rest of the session and tried first next time.
+static const char *const kMirrorPrefixes[] = {
+	"",
+	"https://ghproxy.net/",
+	"https://gh-proxy.com/",
+};
+
+// The mirror index that produced a verified download this session; -1 = none yet. Session-wide
+// on purpose: it only encodes "which source was reachable recently", never persisted.
+static int &PreferredMirrorIndex() {
+	static int preferredMirror = -1;
+	return preferredMirror;
+}
+
+std::vector<std::string> BuildDownloadUrls(const std::string &assetUrl) {
+	const int preferredMirror = PreferredMirrorIndex();
+
+	std::vector<std::string> urls;
+	for (const char *prefix : kMirrorPrefixes)
+		urls.push_back(std::string(prefix) + assetUrl);
+
+	size_t first = 0;
+	if (preferredMirror >= 0 && preferredMirror < (int)urls.size())
+		first = (size_t)preferredMirror;
+	if (first != 0)
+		std::rotate(urls.begin(), urls.begin() + first, urls.end());
+	return urls;
+}
+
 bool DownloadRelease(const ReleaseInfo &release, const std::string &executablePath, std::atomic<bool> *cancel,
 	std::atomic<uint64_t> *downloaded, std::string *error) {
 	std::array<u8, SHA256_HASH_SIZE> expectedHash{};
@@ -339,60 +418,130 @@ bool DownloadRelease(const ReleaseInfo &release, const std::string &executablePa
 		return false;
 	}
 	std::string temporary = executablePath + ".update.tmp";
-	std::remove(temporary.c_str());
-	FILE *file = std::fopen(temporary.c_str(), "wb");
-	if (!file) {
-		*error = "Could not create the update file on the SD card.";
-		return false;
-	}
-	FileDownload download{};
-	download.file = file;
-	download.maximum = release.assetSize;
-	download.cancel = cancel;
-	download.downloaded = downloaded;
-	sha256ContextCreate(&download.hash);
-	CURL *curl = curl_easy_init();
-	if (!curl) {
-		std::fclose(file);
+
+	// Each candidate source gets a full attempt: download into the temp file, then verify shape
+	// (a mirror that returns an HTML error page fails the NRO magic / "<" head check) and hash.
+	// Only a fully verified file counts as success, so the SHA-256 gate applies to mirror results
+	// exactly as it did to direct downloads.
+	std::vector<std::string> urls = BuildDownloadUrls(release.assetUrl);
+	std::string lastError = "The update download failed.";
+	bool verified = false;
+
+	for (size_t attempt = 0; attempt < urls.size() && !verified; ++attempt) {
+		const std::string &url = urls[attempt];
+		if (cancel->load(std::memory_order_relaxed)) {
+			lastError = "Update download cancelled.";
+			break;
+		}
+		printf("[update] downloading from %s\n", url.c_str());
 		std::remove(temporary.c_str());
-		*error = "Could not initialize the update download.";
-		return false;
+		FILE *file = std::fopen(temporary.c_str(), "wb");
+		if (!file) {
+			// Creating the file is not source-dependent - no point trying the other mirrors.
+			*error = "Could not create the update file on the SD card.";
+			return false;
+		}
+		FileDownload download{};
+		download.file = file;
+		download.maximum = release.assetSize;
+		download.cancel = cancel;
+		download.downloaded = downloaded;
+		sha256ContextCreate(&download.hash);
+		downloaded->store(0, std::memory_order_relaxed);
+
+		CURL *curl = curl_easy_init();
+		if (!curl) {
+			std::fclose(file);
+			std::remove(temporary.c_str());
+			*error = "Could not initialize the update download.";
+			return false;
+		}
+		std::pair<std::atomic<bool> *, std::atomic<uint64_t> *> progress{cancel, downloaded};
+		char curlError[CURL_ERROR_SIZE]{};
+		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, FileWrite);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &download);
+		curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)release.assetSize);
+		curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curlError);
+		// A 30 second budget per source: connect fast, and treat <1 KB/s for 30s as a stall that
+		// moves on to the next source. No total-time cap - the file is ~70 MB and slow but
+		// progressing downloads are still worth finishing.
+		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+		SetCommonCurlOptions(curl, &progress);
+		CURLcode result = curl_easy_perform(curl);
+		long responseCode = 0;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
+		curl_easy_cleanup(curl);
+
+		bool fileOK = !download.writeFailed;
+		if (std::fflush(file) != 0 || fsync(fileno(file)) != 0)
+			fileOK = false;
+		if (std::fclose(file) != 0)
+			fileOK = false;
+		fsdevCommitDevice("sdmc");
+
+		if (cancel->load(std::memory_order_relaxed)) {
+			std::remove(temporary.c_str());
+			*error = "Update download cancelled.";
+			return false;
+		}
+		if (result != CURLE_OK || responseCode < 200 || responseCode >= 300 || !fileOK) {
+			lastError = curlError[0] ? std::string(curlError) : "The update download failed.";
+			printf("[update] source failed (%s), trying the next one\n", lastError.c_str());
+			continue;
+		}
+
+		// A mirror that serves its error page with HTTP 200 lands here: it is not an NRO. The
+		// explicit "<" head check gives that case its own message before the magic check would.
+		char head[2] = {};
+		bool looksLikeHtml = false;
+		{
+			FILE *check = std::fopen(temporary.c_str(), "rb");
+			if (check) {
+				looksLikeHtml = std::fread(head, 1, sizeof(head), check) == sizeof(head) &&
+					head[0] == '<';
+				std::fclose(check);
+			}
+		}
+		if (looksLikeHtml) {
+			lastError = "The download source returned an error page instead of the update.";
+			printf("[update] source returned HTML, trying the next one\n");
+			continue;
+		}
+
+		std::array<u8, SHA256_HASH_SIZE> actualHash{};
+		sha256ContextGetHash(&download.hash, actualHash.data());
+		if (actualHash != expectedHash) {
+			lastError = "The downloaded update failed SHA-256 verification.";
+			printf("[update] SHA-256 mismatch on this source, trying the next one\n");
+			continue;
+		}
+		if (!ValidNRO(temporary, release.assetSize)) {
+			lastError = "The downloaded update is not a valid NRO.";
+			printf("[update] invalid NRO on this source, trying the next one\n");
+			continue;
+		}
+
+		verified = true;
+		// Remember the source that worked, so subsequent downloads (retry, second asset) skip the
+		// slow candidates this session already ruled out. urls[] is prefix-tagged, so map the URL
+		// back to its mirror index instead of relying on the rotation order.
+		for (int i = 0; i < (int)std::size(kMirrorPrefixes); ++i) {
+			const size_t prefixLen = std::strlen(kMirrorPrefixes[i]);
+			if (url.size() >= prefixLen && url.compare(0, prefixLen, kMirrorPrefixes[i]) == 0 &&
+				url.compare(prefixLen, std::string::npos, release.assetUrl) == 0) {
+				PreferredMirrorIndex() = i;
+				break;
+			}
+		}
 	}
-	std::pair<std::atomic<bool> *, std::atomic<uint64_t> *> progress{cancel, downloaded};
-	char curlError[CURL_ERROR_SIZE]{};
-	curl_easy_setopt(curl, CURLOPT_URL, release.assetUrl.c_str());
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, FileWrite);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &download);
-	curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)release.assetSize);
-	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curlError);
-	SetCommonCurlOptions(curl, &progress);
-	CURLcode result = curl_easy_perform(curl);
-	long responseCode = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
-	curl_easy_cleanup(curl);
-	bool fileOK = !download.writeFailed;
-	if (std::fflush(file) != 0 || fsync(fileno(file)) != 0)
-		fileOK = false;
-	if (std::fclose(file) != 0)
-		fileOK = false;
-	fsdevCommitDevice("sdmc");
-	if (cancel->load(std::memory_order_relaxed)) {
+
+	if (!verified) {
 		std::remove(temporary.c_str());
-		*error = "Update download cancelled.";
-		return false;
-	}
-	if (result != CURLE_OK || responseCode < 200 || responseCode >= 300 || !fileOK) {
-		std::remove(temporary.c_str());
-		*error = curlError[0] ? curlError : "The update download failed.";
-		return false;
-	}
-	std::array<u8, SHA256_HASH_SIZE> actualHash{};
-	sha256ContextGetHash(&download.hash, actualHash.data());
-	if (actualHash != expectedHash || !ValidNRO(temporary, release.assetSize)) {
-		std::remove(temporary.c_str());
-		*error = actualHash != expectedHash ? "The downloaded update failed SHA-256 verification." :
-			"The downloaded update is not a valid NRO.";
+		*error = lastError;
 		return false;
 	}
 	return true;
@@ -543,7 +692,9 @@ struct SwitchUpdateScreen::Impl {
 				return;
 			}
 			release = std::move(found);
-			state = IsNewer(release.tag, PPSSPP_SWITCH_RELEASE_VERSION) ? UpdateState::UpdateAvailable : UpdateState::UpToDate;
+			// Compare against the release TAG baked into this NRO (see release-tag.txt), not the
+			// bare version: otherwise every v1.20.4.x tag looks newer than "1.20.4" forever.
+			state = IsNewer(release.tag, PPSSPP_SWITCH_RELEASE_TAG) ? UpdateState::UpdateAvailable : UpdateState::UpToDate;
 		});
 	}
 
@@ -726,10 +877,10 @@ void SwitchUpdateScreen::Refresh() {
 		status = ms->T("Checking GitHub for the latest release...");
 		break;
 	case UpdateState::UpdateAvailable:
-		status = ApplySafeSubstitutions(ms->T("A newer version is available. Installed: %1"), PPSSPP_SWITCH_RELEASE_VERSION);
+		status = "有新的版本更新日志如下：";
 		break;
 	case UpdateState::UpToDate:
-		status = ApplySafeSubstitutions(ms->T("PPSSPP is up to date. Installed: %1"), PPSSPP_SWITCH_RELEASE_VERSION);
+		status = "已是最新版本，新版本敬请期待关注喵~";
 		break;
 	case UpdateState::Downloading:
 		status = ApplySafeSubstitutions(ms->T("Downloading %1"), snapshot.release.assetName);
@@ -753,7 +904,7 @@ void SwitchUpdateScreen::Refresh() {
 	statusView_->SetText(status);
 	releaseView_->SetText(showRelease ? snapshot.release.name + " (" + snapshot.release.tag + ")" : "");
 	releaseView_->SetVisibility(showRelease ? V_VISIBLE : V_GONE);
-	notesView_->SetText(showRelease ? snapshot.release.notes : "");
+	notesView_->SetText(showRelease ? snapshot.release.changelog + "\n\n是否更新喵？" : "");
 	notesScroll_->SetVisibility(showRelease ? V_VISIBLE : V_GONE);
 	progressBar_->SetVisibility(snapshot.state == UpdateState::Downloading ? V_VISIBLE : V_GONE);
 	if (snapshot.state == UpdateState::Downloading && snapshot.total > 0)

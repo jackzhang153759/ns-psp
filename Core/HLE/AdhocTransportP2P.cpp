@@ -419,6 +419,10 @@ int P2PTransport::PdpCreate(const SceNetEtherAddr *saddr, int port, int bufferSi
 	}
 
 	if (iResult != 0) {
+		// printf: sceNet DEBUG/INFO never reaches the on-device log; this is the one hook that
+		// tells us *why* the bind failed (EADDRINUSE from a previous session's socket, etc).
+		printf("[p2p-diag] pdp bind failed: port=%u (lport=%u offset=%u isClient=%d errno=%d)\n",
+			(unsigned)(port + portOffset), (unsigned)port, (unsigned)portOffset, (int)isClient, socket_errno);
 		DEBUG_LOG(Log::sceNet, "%s: sock bind failed", __func__);
 		auto n = GetI18NCategory(I18NCat::NETWORKING);
 		g_OSD.Show(OSDType::MESSAGE_ERROR, std::string(n->T("Failed to Bind Port")) + " " + std::to_string(port + portOffset) + "\n" + std::string(n->T("Please change your Port Offset")), 0.0f, "portbindfail");
@@ -715,6 +719,8 @@ int P2PTransport::PtpOpen(const SceNetEtherAddr *saddr, int sport, const SceNetE
 		}
 		else {
 			ERROR_LOG(Log::sceNet, "Socket error (%i) when binding port %u", socket_errno, ntohs(addr.sin_port));
+			printf("[p2p-diag] ptp open bind failed: port=%u (lport=%u offset=%u errno=%d)\n",
+				(unsigned)(sport + portOffset), (unsigned)sport, (unsigned)portOffset, socket_errno);
 			auto n = GetI18NCategory(I18NCat::NETWORKING);
 			g_OSD.Show(OSDType::MESSAGE_ERROR,
 				std::string(n->T("Failed to Bind Port")) + " " + std::to_string(sport + portOffset) + "\n" + std::string(n->T("Please change your Port Offset")), 0.0f, "portbindfail");
@@ -909,6 +915,8 @@ int P2PTransport::PtpListen(const SceNetEtherAddr *saddr, int sport, int bufsize
 			}
 		}
 		else {
+			printf("[p2p-diag] ptp listen bind failed: port=%u (lport=%u offset=%u iResult=%d errno=%d)\n",
+				(unsigned)(sport + portOffset), (unsigned)sport, (unsigned)portOffset, iResult, socket_errno);
 			auto n = GetI18NCategory(I18NCat::NETWORKING);
 			g_OSD.Show(OSDType::MESSAGE_ERROR, std::string(n->T("Failed to Bind Port")) + " " + std::to_string(sport + portOffset) + "\n" + std::string(n->T("Please change your Port Offset")), 0.0f, "portbindfail");
 		}

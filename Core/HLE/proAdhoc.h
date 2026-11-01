@@ -805,6 +805,12 @@ extern uint16_t portOffset;
 extern uint32_t minSocketTimeoutUS;
 extern bool isOriPort;
 extern bool isLocalServer;
+
+// True when the configured adhoc server address points at this console (empty/localhost/127.*/one
+// of the machine's own IPs, enumerated via nifm). Single source of truth for every consumer that
+// used to guess with "localhost or 127.*" only - the own-IP case is what made the Switch treat a
+// looped-back server address as a remote one.
+bool IsLocalAdhocServerAddress(const std::string &server);
 extern std::mutex g_adhocServerIPMutex;
 extern SockAddrIN4 g_adhocServerIP; // Resolved Adhoc Server IP so we don't need to repeatedly resolve the DNS again later
 extern SockAddrIN4 g_localhostIP; // Used to differentiate localhost IP on multiple-instance
