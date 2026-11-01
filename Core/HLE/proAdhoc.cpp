@@ -454,6 +454,7 @@ void deleteAllAdhocSockets() {
 			adhocSockets[i] = NULL;
 		}
 	}
+	pdpDropAllQueues();
 }
 
 void deleteAllGMB() {
@@ -1488,7 +1489,7 @@ static void StartAdhocctlLogin() {
 	// If Server is at localhost and we are in P2P mode, try to bind socket to specific adapter before connecting to prevent 2nd instance being recognized as already existing 127.0.0.1 by adhocctl server
 	// (may not works in WinXP/2003 for IPv4 due to "Weak End System" model)
 	struct adhocctl_addr_v4 bindAddr = {0};
-	const bool bind = isLocalServer && Transport().BindServerConnectionToLocalIp();
+	const bool bind = isLocalServer && !serverHasRelay;
 	if (bind) {
 		bindAddr.ip = g_localhostIP.in.sin_addr.s_addr;
 		bindAddr.port = 0;
@@ -1760,7 +1761,8 @@ void friendFinderPoll() {
 						gameModeMacs.push_back(*(SceNetEtherAddr *)adhocctl_event.connect.mac);
 					}
 					else {
-						it = gameModeMacs.begin() + 1;
+						// After the host, who's first - if the list has one yet.
+						it = gameModeMacs.empty() ? gameModeMacs.end() : gameModeMacs.begin() + 1;
 						gameModeMacs.insert(it, *(SceNetEtherAddr *)adhocctl_event.connect.mac);
 					}
 

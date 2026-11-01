@@ -558,6 +558,8 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
 	const double emulatedStepLimit = 1.0;
 	double emulatedElapsed = 0.0;
 	double lastEmulatedTime = CoreTiming::GetGlobalTimeUs() / 1000000.0;
+	// The wall clock time --realtime paces emulatedElapsed from.
+	double paceStart = startTime;
 	// --frame-stats: flips in each emulated second, starting once the state (if any) is loaded.
 	std::vector<int> flipsPerSecond;
 	double statsStart = -1.0;
@@ -669,7 +671,15 @@ static bool RunAutoTest(GraphicsContext *graphicsContext, CoreParameter &corePar
 			// At an alternate speed (--speed), the emulated clock runs that much faster than the wall clock.
 			const int frameLimit = __DisplayGetFrameTimingLimit();
 			const double speed = frameLimit > 0 ? frameLimit / 60.0 : 1.0;
-			const double ahead = (emulatedElapsed - (time_now_d() - startTime) * speed) / speed;
+			double ahead = (emulatedElapsed - (time_now_d() - paceStart) * speed) / speed;
+			// Wall time the emulated clock stood still (at the instance sync, or waiting for the
+			// network) isn't made up afterwards. Running flat out to catch up would turn the real
+			// latency of the next exchange into emulated seconds, and blocking calls would time out.
+			const double maxBehind = 0.005;
+			if (ahead < -maxBehind) {
+				paceStart += -maxBehind - ahead;
+				ahead = -maxBehind;
+			}
 			// With --lag-sync, lag sync paces every emulated millisecond instead, and two pacers out of
 			// phase would undo each other.
 			if (ahead > 0.001 && !g_Config.bForceLagSync) {
@@ -1205,6 +1215,9 @@ int main(int argc, const char* argv[]) {
 	// Instances talking to each other over ad hoc need their own 127.0.0.N address and MAC, which come
 	// from PPSSPP_ID. Headless doesn't run the instance counter the app uses to pick one.
 	PPSSPP_ID = (uint8_t)cmdLineOptions.instance.value_or(1);
+	if (cmdLineOptions.syncFile.has_value()) {
+		InitInstanceSync(cmdLineOptions.syncFile.value(), cmdLineOptions.instance.value_or(1), cmdLineOptions.syncCount.value_or(1));
+	}
 
 	// pspautotests is plain homebrew PRXes so do not ship user libraries that a retail disc may carry. 
 	// So we must use HLE, unless we install firmware.
@@ -1583,6 +1596,7 @@ int main(int argc, const char* argv[]) {
 		retval = 1;
 	}
 
+	ShutdownInstanceSync();
 	graphicsContext->ShutdownAPI();
 
 	delete graphicsContext;

@@ -1,5 +1,14 @@
 #include "ppsspp_config.h"
 
+#if PPSSPP_PLATFORM(SWITCH)
+// switch.h must come before any other libnx sub-header and before CommonTypes.h's guarded
+// <switch.h> include: libnx has no top-level include guard, and parsing part of it early (with
+// real type names) breaks the macro-renaming contract CommonTypes.h relies on.
+#include <arpa/inet.h>
+#include <switch.h>
+#include <switch/services/nifm.h>
+#endif
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -292,6 +301,35 @@ void DNSResolveFree(addrinfo *res) {
 }
 
 bool GetLocalIP4List(std::vector<std::string> &IP4s) {
+#if PPSSPP_PLATFORM(SWITCH)
+	// The generic paths below (getifaddrs / SIOCGIFCONF / gethostname) all come up empty on
+	// Horizon: libnx does not expose the interface list, so the multiplayer server list ended up
+	// with nothing but localhost. nifm answers with the one address that matters - the console has
+	// a single active network interface at a time, so one IP is the complete enumeration.
+	// The session is opened and closed right here: this runs on the UI thread and a long-lived nifm
+	// session would just be one more service to trip over at exit.
+	if (R_FAILED(nifmInitialize(NifmServiceType_User))) {
+		WARN_LOG(Log::Net, "GetLocalIP4List: nifmInitialize failed");
+		return false;
+	}
+	u32 ipAddress = 0;
+	const Result rc = nifmGetCurrentIpAddress(&ipAddress);
+	nifmExit();
+	if (R_FAILED(rc) || ipAddress == 0) {
+		// Not connected (or the service has no address for us yet) - report honestly instead of
+		// inventing localhost.
+		INFO_LOG(Log::Net, "GetLocalIP4List: no IP address (rc=0x%x ip=0x%08x)", rc, ipAddress);
+		return false;
+	}
+	char ipstr[INET_ADDRSTRLEN]{};
+	if (!inet_ntop(AF_INET, &ipAddress, ipstr, sizeof(ipstr))) {
+		WARN_LOG(Log::Net, "GetLocalIP4List: inet_ntop failed for 0x%08x", ipAddress);
+		return false;
+	}
+	IP4s.push_back(ipstr);
+	INFO_LOG(Log::Net, "GetLocalIP4List: %s (via nifm)", ipstr);
+	return true;
+#else
 	char ipstr[INET6_ADDRSTRLEN]; // We use IPv6 length since it's longer than IPv4
 // getifaddrs first appeared in glibc 2.3, On Android officially supported since __ANDROID_API__ >= 24
 #if defined(_IFADDRS_H_) || (__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 3) || (__ANDROID_API__ >= 24)
@@ -408,6 +446,7 @@ bool GetLocalIP4List(std::vector<std::string> &IP4s) {
 	freeaddrinfo(res); // free the linked list
 	return true;
 #endif
+#endif  // PPSSPP_PLATFORM(SWITCH)
 	return false;
 }
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # Runs several PPSSPP headless instances of a game against each other over ad hoc, and drives them over
 # the WebSocket debugger: press buttons, take screenshots, read frame rates. For testing a game's
-# multiplayer. See docs/adhoc-multiplayer-testing.md.
+# multiplayer, and for measuring what network delay it tolerates. See docs/adhoc-multiplayer-testing.md.
 #
-#   python3 Tools/adhoc_session.py start ~/PSP/GAME.iso -n 2 [--state FILE]
+#   python3 Tools/adhoc_session.py start ~/PSP/GAME.iso -n 2 [--delay 50] [--state FILE]
 #   python3 Tools/adhoc_session.py press cross -i 2
 #   python3 Tools/adhoc_session.py wait 3
 #   python3 Tools/adhoc_session.py shot lobby
@@ -11,9 +11,11 @@
 #   python3 Tools/adhoc_session.py run script.txt     (lines like the commands above, without the prefix)
 #   python3 Tools/adhoc_session.py stop
 #
-# The instances run freely at PSP speed (--realtime, and --lag-sync unless --no-lag-sync), and each one
-# gets its own memory stick with a copy of the real one's savedata, so they can't overwrite each other's
-# (or your) saves. The firmware comes from the real memory stick's NAND.
+# The instances run at PSP speed (--realtime, and --lag-sync unless --no-lag-sync), or at --speed
+# PERCENT of it, kept within an emulated millisecond of each other unless --no-sync, and each one gets its own memory stick with a copy of the real one's savedata,
+# so they can't overwrite each other's (or your) saves. The firmware comes from the real memory stick's
+# NAND. Times in commands (wait, --every, --timeout, --poll) are emulated seconds, so a script runs the
+# same at any speed.
 
 import argparse
 import base64
@@ -162,11 +164,51 @@ def selected(session, which):
 	return [inst for inst in session["instances"] if inst["n"] in wanted]
 
 
+def emulated_seconds(session):
+	# The slowest instance's clock: the one a script is waiting for.
+	times = []
+	for inst in session["instances"]:
+		dbg = Debugger(inst["port"])
+		times.append(dbg.request("cpu.status")["us"] / 1e6)
+		dbg.close()
+	return min(times)
+
+
+def wall_seconds(session, emulated):
+	# About how long `emulated` seconds take, to pace polling.
+	return emulated * 100.0 / session.get("speed", 100)
+
+
+def emulated_sleep(session, seconds):
+	# Script times are emulated seconds, so a script means the same at any --speed (and when the
+	# instances run slower than asked). A clock that stops (a paused instance) ends it after a while.
+	start = emulated_seconds(session)
+	give_up = time.time() + wall_seconds(session, seconds) * 20 + 30
+	while time.time() < give_up:
+		left = seconds - (emulated_seconds(session) - start)
+		if left <= 0:
+			return
+		time.sleep(min(0.05, max(0.005, wall_seconds(session, left))))
+	print("wait: the emulated clock stopped advancing", file=sys.stderr)
+
+
 def find_headless():
 	candidates = glob.glob(os.path.join(ROOT, "build*", "PPSSPPHeadless")) + glob.glob(os.path.join(ROOT, "build*", "PPSSPPHeadless.exe"))
 	if not candidates:
 		sys.exit("No PPSSPPHeadless found in build*/; pass --headless")
 	return max(candidates, key=os.path.getmtime)
+
+
+def wait_for_server(port=27312, timeout=5.0):
+	# The others log in to the first instance's built-in ad hoc server as they start, so it has to be
+	# listening by then. (Emulated time doesn't need it to start first: the instance sync holds it back.)
+	give_up = time.time() + timeout
+	while time.time() < give_up:
+		try:
+			socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
+			return
+		except OSError:
+			time.sleep(0.01)
 
 
 def loopback_aliases_missing(n):
@@ -195,6 +237,12 @@ def cmd_start(args):
 	with open(ini, "w") as f:
 		f.write("[Network]\nproAdhocServer = 127.0.0.1\nAdhocServerRelayMode = %d\n" % (0 if args.p2p else 1))
 	names = [name.strip() for name in args.names.split(",")] if args.names else []
+	sync_file = None
+	if not args.no_sync:
+		# The instances keep within an emulated millisecond of each other through this file (InitInstanceSync).
+		sync_file = os.path.join(args.dir, "sync")
+		with open(sync_file, "wb") as f:
+			f.write(bytes(4096))
 	instances = []
 	for n in range(1, args.n + 1):
 		memstick = os.path.join(args.dir, "memstick%d" % n)
@@ -206,9 +254,19 @@ def cmd_start(args):
 			"--appendconfig=" + ini, "--debugger-run=0", "--timeout-wall=%d" % args.timeout]
 		if not args.no_lag_sync:
 			cmd.append("--lag-sync")
+		if sync_file:
+			cmd += ["--sync-file=" + sync_file, "--sync-count=%d" % args.n]
+		if args.speed != 100:
+			cmd.append("--speed=%d" % args.speed)
 		if n == 1:
 			cmd.append("--adhoc-server")
 		cmd.append("--nickname=" + (names[n - 1] if n <= len(names) else "PPSSPP %d" % n))
+		if args.delay:
+			cmd.append("--adhoc-delay=%d" % args.delay)
+		if args.jitter:
+			cmd.append("--adhoc-jitter=%d" % args.jitter)
+		if args.loss:
+			cmd.append("--adhoc-loss=%d" % args.loss)
 		if args.log:
 			cmd.append("--log")
 		if args.state:
@@ -219,8 +277,7 @@ def cmd_start(args):
 			proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
 		instances.append({"n": n, "pid": proc.pid, "log": log, "port": None})
 		if n == 1:
-			# Let the built-in server come up before the others log in.
-			time.sleep(1.0)
+			wait_for_server()
 	for inst in instances:
 		for _ in range(100):
 			with open(inst["log"], errors="replace") as f:
@@ -232,10 +289,12 @@ def cmd_start(args):
 			time.sleep(0.1)
 		if inst["port"] is None:
 			sys.exit("Instance %d didn't open a debugger port; see %s" % (inst["n"], inst["log"]))
-	session = {"game": args.game, "instances": instances, "lagSync": not args.no_lag_sync, "p2p": args.p2p}
+	session = {"game": args.game, "instances": instances, "delay": args.delay, "jitter": args.jitter,
+		"loss": args.loss, "lagSync": not args.no_lag_sync, "p2p": args.p2p, "speed": args.speed}
 	with open(session_file(args), "w") as f:
 		json.dump(session, f, indent=1)
-	print("Started %d instances (%s), session in %s" % (args.n, "P2P" if args.p2p else "relay", args.dir))
+	print("Started %d instances (%s%s), session in %s" % (args.n, "P2P" if args.p2p else "relay",
+		", delay %d ms" % args.delay if args.delay else "", args.dir))
 
 
 def cmd_stop(args):
@@ -257,7 +316,7 @@ def cmd_press(args):
 	session = load_session(args)
 	for t in range(args.times):
 		if t > 0:
-			time.sleep(args.every)
+			emulated_sleep(session, args.every)
 		for inst in selected(session, args.i):
 			dbg = Debugger(inst["port"])
 			# The answer only comes once the press is over, so don't wait for it.
@@ -284,7 +343,7 @@ def cmd_type(args):
 			dbg = Debugger(inst["port"])
 			dbg.send("input.buttons.press", button=button, duration=3)
 			dbg.close()
-		time.sleep(0.15)
+		emulated_sleep(session, 0.15)
 
 	row, col = 0, 0
 	for ch in args.text:
@@ -317,7 +376,7 @@ def cmd_stick(args):
 		dbg = Debugger(inst["port"])
 		dbg.request("input.analog.send", x=args.x, y=args.y)
 		dbg.close()
-	time.sleep(args.seconds)
+	emulated_sleep(session, args.seconds)
 	for inst in insts:
 		dbg = Debugger(inst["port"])
 		dbg.request("input.analog.send", x=0, y=0)
@@ -325,7 +384,7 @@ def cmd_stick(args):
 
 
 def cmd_wait(args):
-	time.sleep(args.seconds)
+	emulated_sleep(load_session(args), args.seconds)
 
 
 def grab_png(inst, attempts=3):
@@ -415,24 +474,26 @@ def cmd_until(args):
 		sys.exit("until needs a reference image or --pixel")
 	session = load_session(args)
 	waiting = list(selected(session, args.i))
-	end = time.time() + args.timeout
-	last_press = 0.0
+	# --timeout, --every and --poll are emulated seconds, like wait's.
+	start = emulated_seconds(session)
+	last_press = None
 	while waiting:
-		if time.time() > end:
+		now = emulated_seconds(session)
+		if now - start > args.timeout:
 			for inst in waiting:
 				path = os.path.join(args.dir, "until_failed_%d.png" % inst["n"])
 				with open(path, "wb") as f:
 					f.write(grab_png(inst))
 			sys.exit("until: instances %s never matched; their screens are in until_failed_N.png" % ",".join(str(i["n"]) for i in waiting))
-		if args.press and time.time() - last_press >= args.every:
+		if args.press and (last_press is None or now - last_press >= args.every):
 			for inst in waiting:
 				dbg = Debugger(inst["port"])
 				dbg.send("input.buttons.press", button=args.press, duration=6)
 				dbg.close()
-			last_press = time.time()
+			last_press = now
 		waiting = [inst for inst in waiting if not screen_matches(args, Image.open(io.BytesIO(grab_png(inst))))]
 		if waiting:
-			time.sleep(args.poll)
+			time.sleep(wall_seconds(session, args.poll))
 
 
 def cmd_crop(args):
@@ -503,7 +564,12 @@ def build_parser():
 	p.add_argument("-n", type=int, default=2, help="Number of instances (default 2)")
 	p.add_argument("--p2p", action="store_true", help="Talk directly instead of through the relay (needs a loopback address per instance)")
 	p.add_argument("--names", help="Comma-separated nicknames for the instances (default: PPSSPP 1, PPSSPP 2, ...)")
+	p.add_argument("--delay", type=int, default=0, help="Simulated delay in emulated ms on received ad hoc datagrams (each way)")
+	p.add_argument("--jitter", type=int, default=0, help="Up to this many ms more, at random")
+	p.add_argument("--loss", type=int, default=0, help="Percentage of received ad hoc datagrams dropped")
 	p.add_argument("--no-lag-sync", action="store_true", help="Pace once per frame, like the app's default")
+	p.add_argument("--no-sync", action="store_true", help="Let each instance run at its own pace instead of keeping them in step in emulated time")
+	p.add_argument("--speed", type=int, default=100, help="Run at this percentage of PSP speed (scripts count emulated time)")
 	p.add_argument("--state", help="Savestate to load at boot in every instance")
 	p.add_argument("--memstick", default=DEFAULT_MEMSTICK, help="Memory stick to take the firmware and savedata from")
 	p.add_argument("--graphics", default="vulkan")

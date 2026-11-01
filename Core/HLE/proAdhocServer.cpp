@@ -38,6 +38,7 @@
 #include "Common/File/FileUtil.h"
 #include "Common/TimeUtil.h"
 #include "Common/Net/Resolve.h"
+#include "Common/StringUtils.h"
 #include "Core/Util/PortManager.h"
 #include "Core/Instance.h"
 #include "Core/Core.h"
@@ -1658,6 +1659,29 @@ const char * strcpyxml(char * out, const char * in, uint32_t size)
  * @param argv Arguments
  * @return OS Error Code
  */
+// True when the configured adhoc server address resolves to this console itself: empty (the client
+// falls back to localhost), the loopback name/address, or one of the machine's own IP addresses.
+static bool IsLocalAdhocServerAddress(const std::string &server) {
+	if (server.empty()) {
+		return true;
+	}
+	if (equalsNoCase(server, "localhost")) {
+		return true;
+	}
+	if (server.rfind("127.", 0) == 0) {
+		return true;
+	}
+	std::vector<std::string> ownIPs;
+	if (net::GetLocalIP4List(ownIPs)) {
+		for (const std::string &ip : ownIPs) {
+			if (equalsNoCase(server, ip)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 int proAdhocServerThread(int port) // (int argc, char * argv[])
 {
 	SetCurrentThreadAffinity(ThreadAffinityRole::IO);
@@ -1665,11 +1689,28 @@ int proAdhocServerThread(int port) // (int argc, char * argv[])
 	// Result
 	int result = 0;
 
-	if (net::HostPortExists(g_Config.sProAdhocServer, SERVER_PORT, 200)) {
+	// printf, not INFO_LOG: the sceNet channel's INFO level never reaches the on-device log, and
+	// every decision this thread makes at startup has been invisible there so far.
+	printf("[adhoc-diag] server thread: port=%d sProAdhocServer='%s'\n", port, g_Config.sProAdhocServer.c_str());
+
+	// Does the configured server address point back at this very console? When the built-in server
+	// is enabled and the address is local (empty, localhost, 127.x or one of our own IPs), a
+	// successful probe can only mean the *previous* session's listener is still lingering - the
+	// user is dialing themselves. Trusting that probe skips starting the real server and every
+	// later connect fails with "connection refused", which is exactly what happened across
+	// LoadExec restarts. Local addresses therefore skip the probe; genuinely remote servers are
+	// still probed so we don't stack a second server on top of a working one.
+	const bool serverAddressIsLocal = IsLocalAdhocServerAddress(g_Config.sProAdhocServer);
+	printf("[adhoc-diag] server thread: address '%s' is %s\n",
+		g_Config.sProAdhocServer.c_str(), serverAddressIsLocal ? "LOCAL (probe skipped)" : "remote (probing)");
+
+	if (!serverAddressIsLocal && net::HostPortExists(g_Config.sProAdhocServer, SERVER_PORT, 200)) {
+		printf("[adhoc-diag] server thread: a server is already reachable at '%s':%d - NOT starting the built-in one\n", g_Config.sProAdhocServer.c_str(), SERVER_PORT);
 		INFO_LOG(Log::sceNet, "AdhocServer: Skipped starting because the server is already available");
 		return 0;
 	}
 	else {
+		printf("[adhoc-diag] server thread: starting the built-in one\n");
 		INFO_LOG(Log::sceNet, "AdhocServer: Begin of AdhocServer Thread");
 	}
 
@@ -1681,6 +1722,7 @@ int proAdhocServerThread(int port) // (int argc, char * argv[])
 
 	// Create Listening Socket
 	int server = create_listen_socket(port); //SERVER_PORT
+	printf("[adhoc-diag] server listen socket: %s (server=%d errno=%d)\n", server != SOCKET_ERROR ? "OK (bound INADDR_ANY)" : "FAILED", server, socket_errno);
 
 	// Created Listening Socket
 	if(server != SOCKET_ERROR)
@@ -1699,6 +1741,15 @@ int proAdhocServerThread(int port) // (int argc, char * argv[])
 
 		// Notify User
 		INFO_LOG(Log::sceNet, "AdhocServer: Shutdown complete");
+	}
+
+	// Single owner for the listening socket: whatever path got us here, once this thread ends the
+	// listener must be gone, or the next session's probe dials our own zombie and skips starting
+	// the real server (the across-LoadExec "server never starts" bug).
+	if (server != SOCKET_ERROR) {
+		closesocket(server);
+		server = SOCKET_ERROR;
+		printf("[adhoc-diag] server thread: listening socket closed\n");
 	}
 
 	//_status = 0;
@@ -2064,20 +2115,33 @@ int server_loop(int server)
 			user = next;
 		}
 
-		// Prevent needless CPU Overload (1ms Sleep)
-		// !!!! COMMENT NOT REFLECTING REALITY
-		sleep_ms(10, "pro-adhoc-poll");
-
-		// Don't do anything if it's paused, otherwise the log will be flooded
-		while (adhocServerRunning && Core_IsStepping() && coreState != CORE_POWERDOWN)
-			sleep_ms(10, "pro-adhot-paused-poll");
+		// Wait until a login or a message comes in, rather than polling: with nothing to do the server
+		// sleeps, and a message is handled as soon as it arrives. Woken at least every 50 ms anyway, to
+		// notice adhocServerRunning going false.
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		int maxfd = server;
+		FD_SET(server, &readfds);
+		for (SceNetAdhocctlUserNode *u = _db_user; u != NULL; u = u->next) {
+#if !defined(_WIN32)
+			if (u->stream >= FD_SETSIZE) {
+				continue;
+			}
+#endif
+			FD_SET(u->stream, &readfds);
+			maxfd = std::max(maxfd, u->stream);
+		}
+		timeval tv;
+		tv.tv_sec = 0;
+		tv.tv_usec = 50000;
+		select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
 	}
 
 	// Free User Database Memory
 	free_database();
 
-	// Close Server Socket
-	closesocket(server);
+	// The listening socket is closed by the thread function after server_loop returns - keep the
+	// close there so every exit path of this loop (present and future) is covered by one owner.
 
 	// Return Success
 	return 0;

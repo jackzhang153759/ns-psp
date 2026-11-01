@@ -639,6 +639,10 @@ public:
 	bool bInfrastructureAutoDNS;
 	bool bAllowSavestateWhileConnected;  // Developer option, ini-only. No normal users need this, it's always wrong to save/load state when online.
 	bool bAllowSpeedControlWhileConnected;  // Useful in some games but not recommended.
+	// Developer options, ini-only: simulate a slower network for the ad hoc datagrams received.
+	int iAdhocSimDelayMs;  // Added to every datagram's delivery, in emulated time.
+	int iAdhocSimJitterMs;  // Up to this much more, at random (order is kept).
+	int iAdhocSimLossPercent;  // Datagrams dropped.
 
 	std::string sAdhocServerListUrl;
 	std::vector<std::string> vCustomAdhocServerList;
@@ -829,6 +833,8 @@ public:
 	static const ConfigSettingRef *FindSetting(const void *ptr);
 	static int GetDefaultValueInt(const int *configSetting);
 	static float GetDefaultValueFloat(const float *configSetting);
+	// Sets the setting that ptr points to back to its default. Returns true if that changed it.
+	static bool RestoreSettingToDefault(void *ptr);
 
 	void DoNotSaveSetting(void *configSetting) {
 		settingsNotToSave_.push_back(configSetting);

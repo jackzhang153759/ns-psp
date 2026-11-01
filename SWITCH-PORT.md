@@ -111,9 +111,9 @@ bash scripts/switch/sync-upstream.sh --merge --build
 
 ---
 
-## 已知问题 / 未修复 BUG（2026-11-01 全量盘点）
+## 已知问题 / 未修复 BUG（2026-11-01 v1.20.4.1 更新）
 
-按影响排序。前 3 条是功能性 BUG，其余为次要或取舍类。
+按影响排序。
 
 1. **退出时 Switch 弹「由于发生错误，软件已关闭」**（次要，用户接受）
    退出 PPSSPP（含 HOME 回桌面）时偶发系统报错弹窗，软件本体功能不受影响，重进即可。
@@ -127,12 +127,24 @@ bash scripts/switch/sync-upstream.sh --merge --build
    该合集内嵌 Neo-Geo 模拟器，启动时有 work RAM 自检；旧版金手指写自检区导致
    `work ram error`（实测 read 03e7 ≠ write 5555）。**不是 PPSSPP 的 BUG**，
    需要针对该合集重新抓地址，搁置中（其他游戏金手指正常）。
-5. **更新检查器指向 NaGaa95 的发布页**（`UI/SwitchUpdate.cpp:48`）
-   本仓库没有公开 release 前，检查更新会提示下载别人的构建。等仓库地址确定后改指向，或临时禁用。
+5. **Switch 版内置 AdHoc 服务器不含 aemu 数据中继**
+   内置服务器提供大厅撮合，但 aemu_postoffice 数据中继因 enet 符号冲突未链入 Switch 构建
+   （`sceNetAdhoc.cpp` `#if !PPSSPP_PLATFORM(SWITCH)`）。**局域网联机走 P2P 直连模式即可**
+   （两台设备的包中继都设为禁用），中继模式仅供连接外部中继服务器时使用。
 6. **FastLoad boost 的 GPU 取舍**（仅未装 sys-clk 的机器）
    启动时请求的 CPU 满频档在部分机型会压低 GPU 频率。装了 sys-clk 的用户可自行覆盖；
    如需彻底规避可加"性能档开关"，未做。
-7. **设置→工具 Logging 的 Hint 中文**：编码缺陷已修复（见 pitfalls.md F2）。
-   若在 md5 `4f6ba28b` 及以后的版本上仍见方块字，属渲染层问题，需截图进一步排查（低概率）。
-8. **Mesa 驱动落后于上游 Mesa**（可选优化项，非 BUG）
+7. **Mesa 驱动落后于上游 Mesa**（可选优化项，非 BUG）
    升级可行性报告见 `docs/switch/mesa-upgrade-feasibility.md`，待用户决定是否跟进。
+
+---
+
+## 局域网联机快速指南（Switch ↔ 安卓/PSP 等）
+
+1. **端口偏移**：所有联机设备的 Port Offset 都设为 **10000** 且保持一致
+   （小于 1024 的端口会被系统拒绝，游戏内部端口经常是 1，见 `docs/switch/pitfalls.md` F11）
+2. **服务器**：选一台设备当服务器——它填 `localhost` + 勾选「启用内置的 Ad Hoc 服务器」+
+   启用联网；其他设备填这台机器的**局域网真实 IP**（联机服务器列表里能看到本机 IP）
+3. **中继**：局域网联机两边都把「使用服务器提供的包中继」设为**禁用**（P2P 直连，延迟最低）；
+   只有连外部中继服务器（如 socom.cc）时才开中继
+4. **时序**：服务器那台先启动游戏（内置服务器随游戏启动/销毁），客户端再连

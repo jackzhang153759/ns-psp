@@ -32,6 +32,13 @@ What `start` sets up, and why:
 - **`--realtime --lag-sync`.** Without lag sync, emulation runs each frame in a burst and then waits,
   and data that arrives in between waits for the next frame: a round trip between two instances took
   15-31 ms instead of about 3 ms. `--no-lag-sync` turns it off, to see what the app's default does.
+- **The instances keep in step in emulated time** (`--sync-file`, `--sync-count`): at every emulated
+  millisecond each one waits until all the others have got there too, through a small file they all
+  map. Without it, an instance the machine runs slower than the others falls behind, and anything
+  timed across instances (a timeout, a peer leaving) comes out differently with the load. Any number
+  of instances can share the file. One that stops moving (paused in a debugger, or crashed) is waited
+  for 2 seconds, then left out until it moves again. `--no-sync` turns it off; `Tools/adhoc_multi.py`,
+  which runs the pair tests, syncs the same way.
 - **Relay mode** by default, since most players use it. `--p2p` makes the instances talk directly
   instead (see below).
 - **Each instance has its own nickname** (`--nickname`), "PPSSPP 1", "PPSSPP 2" and so on, or what
@@ -76,10 +83,11 @@ What `start` does for each instance N (instance 1 also gets `--adhoc-server`):
 ```bash
 build-release/PPSSPPHeadless --graphics=vulkan --memstick=MEMSTICK_N --nand=$HOME/.config/ppsspp/PSP/NAND \
     --realtime --lag-sync --instance=N --nickname="PPSSPP N" --appendconfig=network.ini --debugger-run=0 \
-    --timeout-wall=3600 GAME.iso
+    --sync-file=SYNC --sync-count=2 --timeout-wall=3600 GAME.iso
 ```
 
 `--instance=N` gives the instance its own MAC address and its own address, 127.0.0.N, for ad hoc data.
+`SYNC` is a file of 4096 zero bytes, made before the instances start and shared by all of them.
 `network.ini` points it at the local server:
 
 ```ini
@@ -106,6 +114,35 @@ sudo ifconfig lo0 alias 127.0.0.3 up
 ```
 
 `adhoc_session.py start --p2p` checks for them and prints these commands if any are missing.
+
+## Simulating a slow network
+
+Three options delay or drop the ad hoc datagrams an instance receives, to see how a game copes with a
+distant player or a bad connection. They work the same in relay and P2P mode, and are also in the ini,
+under `[Network]`, for the app.
+
+| Option | ini | What it does |
+|---|---|---|
+| `--adhoc-delay=MS` | `AdhocSimDelayMs` | Each datagram reaches the game MS milliseconds after it arrived. |
+| `--adhoc-jitter=MS` | `AdhocSimJitterMs` | Up to MS more, at random. Datagrams stay in order. |
+| `--adhoc-loss=PERCENT` | `AdhocSimLossPercent` | Datagrams dropped. |
+
+`adhoc_session.py start` takes them as `--delay`, `--jitter` and `--loss`, and passes them to every
+instance; `Tools/adhoc_multi.py` passes them through to the instances it starts. Things to know:
+
+- **Times are emulated**, so a delay is the same at any `--speed`.
+- **The delay is one way, on the receiving side.** With it on every instance, a round trip takes twice
+  the delay more: `--adhoc-delay=50` turns a 2 ms P2P round trip into 102 ms (pspautotests
+  `net/adhoc/pair/timing`).
+- **Runs repeat.** Jitter and loss come from random numbers seeded per instance when the game starts ad
+  hoc, so with the instances in step (`--sync-file`) the same datagrams are lost each run.
+- **PDP** (including matching and game mode): a datagram arrives at the next emulated millisecond after
+  it's due, and goes into the socket's buffer then, where it's dropped if it doesn't fit, as on a PSP.
+- **PTP** is held on the sending side instead: a send is accepted at once and goes out when due, in
+  order, which with the same options on every instance gives the same round trip. Nothing is lost on a
+  connection: a "lost" send goes out one retransmit interval (the one given to PtpOpen) later. A flush
+  waits for what's held, and GetPtpStat counts it as not yet sent.
+- The ad hoc server's own messages (logins, groups, peer lists) aren't delayed.
 
 ## Measuring
 

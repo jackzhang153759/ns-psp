@@ -185,6 +185,23 @@ NACP 图标塞 PNG 是非法文件，桌面会显示问号。`tools/make_forward
 `git describe` 要加 `--match "v1.*"`，克隆时 `--unshallow`。版本号由
 `CMakeLists.txt` 的 `PPSSPP_SWITCH_RELEASE_VERSION "1.20.4"` FORCE 钉住，跟随主线手动更新。
 
+### F11. 联机必设端口偏移 ≥1024（Socket Error 13 / EACCES）⭐
+游戏内部 PTP/PDP 端口很小（如合金弹头 XX 是 1），portOffset=0 时真实绑定 1 号端口 →
+**Horizon 拒绝（EACCES，权限拒绝）**，症状是"无法绑定端口1"+联机失败。
+**两台联机设备的 Port Offset 都必须 ≥1024 且一致，推荐 10000**。日志铁证：
+`AdhocTransportP2P.cpp:918 sceNetAdhocPtpListen[1]: Socket Error (13)`。
+
+### F12. NSP 快捷方式烧录的 NRO 路径区分大小写
+NSP 里 nextNroPath 是生成时烧死的。主界面 NSP 曾漏传 `--sdmc` 吃了默认小写
+`/switch/ppsspp/PPSSPP.nro`，而实际部署在大写 `/switch/PPSSPP/` → 快捷方式启动的永远是旧 NRO
+（数据目录/VFS 注册路径可对照确认实际运行位置）。**换/更新 NRO 后联机"没生效"先查这个**。
+已把 make_forwarder_nsp 的两个 NSP 统一重做成大写路径，脚本默认值待改。
+
+### F13. Switch 日志里 Log::sceNet 的 INFO 级被过滤
+日志文件能看到 I[System]、V[IO]，但 **I[sceNet] 永远不出现**（通道级过滤）——
+诊断代码若用 INFO_LOG(Log::sceNet) 会"打印了但看不见"，造成"代码没跑"的假象。
+诊断性输出一律用 **printf 直通**（同 [umdio]/[hle] SLOW 做法）。
+
 ---
 
 ## G. 快速诊断表
