@@ -545,9 +545,13 @@ void InitLocalhostIP() {
 	g_localhostIP.in.sin_port = 0;
 
 	std::string serverStr(StripSpaces(g_Config.sProAdhocServer));
-	// Unified check (see proAdhoc.h): recognizes the console's own IP, not just literal
-	// localhost/127.* - a server address that points back at us is a local server.
-	isLocalServer = IsLocalAdhocServerAddress(serverStr);
+	// isLocalServer must keep its original, narrow meaning: "several instances on this very
+	// machine talking over 127.0.0.1". It is NOT "the server address happens to be my own IP".
+	// Widening it (e.g. via IsLocalAdhocServerAddress) makes AdhocTransportP2P bind to, and
+	// address peers through, this console's own IP instead of the peer's - which breaks
+	// multiplayer between physical devices (build/search both see nothing). The own-IP check is
+	// only legitimate for the built-in server's start-up probe, see proAdhocServer.cpp.
+	isLocalServer = (!strcasecmp(serverStr.c_str(), "localhost") || serverStr.find("127.") == 0);
 }
 
 static void __ApctlState(u64 userdata, int cyclesLate) {
