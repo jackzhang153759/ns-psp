@@ -1,5 +1,22 @@
 # 更新记录
 
+## 2026-11-06 · v1.20.4.4（退出崩溃修复）
+
+- **核心修复：退出 PPSSPP 不再弹「由于发生错误，软件已关闭」**（真机已验证通过，用户 2026-11-06 确认）
+  - 根因：本项目交付 `.nro`，`envIsNso()==false`，而 `SDL/SDLMain.cpp` 强制声明 `AppletType_Application`；libnx `_appletCleanup` 默认只在 `envIsNso()==true` 或 `__nx_applet_exit_mode==1` 时注册 `_appletExitProcess`（向 AM 发 `ISelfController cmd 0 Exit` 的退出握手）。默认 mode=0 让整个握手被跳过，HOS 判异常终止 → 弹框。
+  - 修法：定义强符号 `u32 __nx_applet_exit_mode = 1;` 覆盖 libnx 的 weak 默认值，NRO 下也建立握手。
+  - 同时修正退出 teardown：跳过 `fsdevUnmountAll()` 与 `fsExit()`（前者在有打开的 sdmc 日志 `FILE*` 时崩溃，后者 `sessionmgrClose` 会关掉日志写路径依赖的 fs 会话）；保留 `timeExit/hidExit/appletExit/smExit`，`__nx_exit(0, envGetExitFuncPtr())` 就地求值；日志全程可写并在结束前显式 `fclose` 落盘。
+  - 增加运行时诊断：`envIsNso()/appletGetAppletType()/__nx_applet_type`、AM 握手 `retBefore/retAfter` 与 `handshake established/MISSING` 打印。
+  - 完整七轮排障过程见 `docs/switch/退出崩溃修复日志.md`。
+- **本版包含此前已发布的功能**（简要列，不展开）：
+  - 主线合并 `3bc60270e`（123 个提交）
+  - XMB 系统更新双入口（首页按钮 + VSH 拦截，从 GitHub 检查更新）
+  - 怪猎 3 HD 字体 `ForceInternalFont` compat flag（装固件也正常显示中文）
+  - UMD 插拔 / UMD Video、金手指汉化、`disc0:` I/O 埋点
+  - Saved folders 配置写入修复、快捷方式 NRO 配置读取修复
+- **产物**：`PPSSPP.nro` 74,004,918 字节，MD5 `7dffc2142ae91a1f21799657c9f59afe`，内嵌 release tag `v1.20.4.4`（在线更新器据此判新旧）
+- 内部版本号跟随 PPSSPP 主线 1.20.4，release tag 顺延 `v1.20.4.x`。
+
 ## 2026-10-31 · 整理为可发布的开源项目
 
 - 整理项目结构，补齐发布所需文档：
